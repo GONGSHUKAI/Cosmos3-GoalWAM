@@ -14,6 +14,7 @@ from cosmos_framework.data.vfm.action.datasets.bridge_orig_lerobot_dataset impor
 from cosmos_framework.data.vfm.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.vfm.action.datasets.robomind_franka_dataset import RoboMINDFrankaDataset
 from cosmos_framework.data.vfm.action.datasets.umi_lerobot_dataset import UMILeRobotDataset
+from cosmos_framework.data.vfm.action.datasets.robotwin_lerobot_dataset import RoboTwinLeRobotDataset
 
 __all__ = [
     "ActionBaseDataset",
@@ -22,4 +23,5 @@ __all__ = [
     "DROIDLeRobotDataset",
     "RoboMINDFrankaDataset",
     "UMILeRobotDataset",
+    "RoboTwinLeRobotDataset",
 ]

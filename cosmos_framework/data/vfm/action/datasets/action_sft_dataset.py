@@ -19,6 +19,7 @@ from typing import Any
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from cosmos_framework.data.vfm.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
+from cosmos_framework.data.vfm.action.datasets.robotwin_lerobot_dataset import RoboTwinLeRobotDataset
 from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
 
 
@@ -125,6 +126,67 @@ def get_action_droid_sft_dataset(
         use_image_augmentation=use_image_augmentation,
         use_filter_dict=use_filter_dict,
         filter_dict_path=filter_dict_path,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_robotwin_sft_dataset(
+    *,
+    root: str,
+    fps: float = 30.0,
+    chunk_length: int = 32,
+    mode: str = "policy",
+    use_state: bool = True,
+    action_normalization: str | None = None,
+    viewpoint: str = "concat_view",
+    use_image_augmentation: bool = False,
+    resolution: str | int = "384x320",
+    target_resolution: str | None = None,
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = False,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+) -> Dataset:
+    """Build the RoboTwin (aloha-agilex) action SFT dataset: 14D absolute joint +
+    ``use_state``, concat_view, chunk_length 32. Mirrors
+    ``get_action_droid_sft_dataset`` without the filter-dict / ee_pose paths.
+
+    ``action_normalization`` toggles the per-joint normalization ablation:
+    ``None`` (default) trains on raw joint qpos (cosmos-DROID behavior);
+    ``"meanstd"`` z-scores each of the 14 dims with the bundled RoboTwin stats
+    (matching FastWAM's global z-score). The eval server must use the same
+    setting to denormalize predicted actions back to qpos."""
+    # Keep the raw concat canvas and ActionTransformPipeline bucket in lockstep so
+    # the transform records image_size=[target_h,target_w,target_h,target_w].
+    if target_resolution is None:
+        target_resolution = str(resolution)
+    dataset = RoboTwinLeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        viewpoint=viewpoint,
+        mode=mode,
+        use_state=use_state,
+        action_normalization=action_normalization,
+        use_image_augmentation=use_image_augmentation,
+        target_resolution=target_resolution,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,

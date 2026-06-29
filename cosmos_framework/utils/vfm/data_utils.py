@@ -26,7 +26,7 @@ def get_vision_data_resolution(spatial_shape: tuple[int, int]) -> str:
         spatial_shape: Tuple of (height, width) in pixels.
 
     Returns:
-        Resolution string: "256", "480", "720", or "768".
+        Resolution string: "256", "384x320", "480", "736x640", "720", or "768".
 
     Raises:
         ValueError: If the spatial shape is unsupported.
@@ -37,6 +37,11 @@ def get_vision_data_resolution(spatial_shape: tuple[int, int]) -> str:
     """
     if spatial_shape in _RESOLUTION_768_SHAPES:
         return "768"
+
+    if spatial_shape == (384, 320):
+        return "384x320"
+    if spatial_shape == (736, 640):
+        return "736x640"
 
     min_dim = min(spatial_shape[0], spatial_shape[1])
     if min_dim <= 256:
