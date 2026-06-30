@@ -206,6 +206,12 @@ action_policy_robotwin_nano = LazyDict(
                             #   ...dataloader_train.dataloader.datasets.robotwin.dataset.action_normalization=meanstd
                             # The eval server must pass the matching --action-normalization to denormalize.
                             action_normalization=None,
+                            # FastWAM-style video temporal ablation toggle:
+                            #   False -> Cosmos-DROID behavior, 33 video frames (0..32)
+                            #   True  -> video frames 0,4,8,...,32; actions stay 33 rows
+                            # If enabling this, also override:
+                            #   model.config.tokenizer.encode_exact_durations=[9]
+                            downsample_video_frames=False,
                             viewpoint="concat_view",  # head 256x320 (top) + L/R wrists 128x160 each (bottom)
                             resolution="384x320",  # exact RoboTwin concat bucket; no square padding
                             max_action_dim="${model.config.max_action_dim}",

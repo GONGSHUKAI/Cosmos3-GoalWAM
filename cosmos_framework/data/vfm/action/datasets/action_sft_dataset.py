@@ -152,6 +152,8 @@ def get_action_robotwin_sft_dataset(
     action_normalization: str | None = None,
     viewpoint: str = "concat_view",
     use_image_augmentation: bool = False,
+    downsample_video_frames: bool = False,
+    video_downsample_factor: int = 4,
     resolution: str | int = "384x320",
     target_resolution: str | None = None,
     max_action_dim: int = 64,
@@ -172,11 +174,16 @@ def get_action_robotwin_sft_dataset(
     ``None`` (default) trains on raw joint qpos (cosmos-DROID behavior);
     ``"meanstd"`` z-scores each of the 14 dims with the bundled RoboTwin stats
     (matching FastWAM's global z-score). The eval server must use the same
-    setting to denormalize predicted actions back to qpos."""
+    setting to denormalize predicted actions back to qpos.
+
+    ``downsample_video_frames`` enables the FastWAM-style temporal ablation:
+    frames ``0,4,8,...,32`` are used for the video stream while the action
+    stream remains the original ``chunk_length+1`` rows."""
     # Keep the raw concat canvas and ActionTransformPipeline bucket in lockstep so
     # the transform records image_size=[target_h,target_w,target_h,target_w].
     if target_resolution is None:
         target_resolution = str(resolution)
+    video_factor = int(video_downsample_factor) if downsample_video_frames else 1
     dataset = RoboTwinLeRobotDataset(
         root=root,
         fps=fps,
@@ -187,10 +194,12 @@ def get_action_robotwin_sft_dataset(
         action_normalization=action_normalization,
         use_image_augmentation=use_image_augmentation,
         target_resolution=target_resolution,
+        video_downsample_factor=video_factor,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
         cfg_dropout_rate=cfg_dropout_rate,
+        action_video_downsample_factor=video_factor,
         max_action_dim=max_action_dim,
         append_viewpoint_info=append_viewpoint_info,
         append_duration_fps_timestamps=append_duration_fps_timestamps,

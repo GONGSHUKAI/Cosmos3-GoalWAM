@@ -35,7 +35,7 @@ def normalize_action(
         denom = (q99 - q01).clamp(min=1e-8)
         return 2.0 * (action - q01) / denom - 1.0
     if method == "meanstd":
-        return (action - stats["mean"]) / stats["std"].clamp(min=1e-8)
+        return ((action - stats["mean"]) / stats["std"].clamp(min=1e-8)).clamp(-5.0, 5.0)
     if method == "minmax":
         lo, hi = stats["min"], stats["max"]
         denom = (hi - lo).clamp(min=1e-8)

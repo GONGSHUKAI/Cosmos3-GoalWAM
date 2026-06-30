@@ -43,9 +43,11 @@ init_script()
 import argparse
 import base64
 import json
+from pathlib import Path
 import socket
 import socketserver
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -89,6 +91,36 @@ _CONCAT_VIEW_DESCRIPTION = (
     "left-arm wrist on the left and right-arm wrist on the right."
 )
 _DEFAULT_OUTPUT_DIR = DEFAULT_FALLBACK_OUTPUT_DIR / "robotwin"
+
+
+def _infer_training_config_file_from_checkpoint(checkpoint_path: str) -> str | None:
+    """Return the saved training config for a local raw-DCP iter dir, if present."""
+    if "://" in checkpoint_path:
+        return None
+    path = Path(checkpoint_path).expanduser().absolute()
+
+    if (path / "model").is_dir() and path.name.startswith("iter_"):
+        iter_dir = path
+    elif path.name == "model" and path.parent.name.startswith("iter_"):
+        iter_dir = path.parent
+    elif path.name.startswith("iter_"):
+        iter_dir = path
+    else:
+        return None
+
+    run_dir = iter_dir.parent.parent
+    config_file = run_dir / "config.yaml"
+    return str(config_file) if config_file.is_file() else None
+
+
+def _load_saved_training_config(config_file: str | None) -> Any | None:
+    if config_file is None:
+        return None
+    try:
+        return OmegaConf.load(config_file)
+    except Exception as exc:
+        log.warning(f"[robotwin-policy-server] could not load saved training config {config_file}: {exc}")
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +169,7 @@ def _read_action_normalization_from_config(training_config: Any) -> str | None:
             return None
         for key, val in items:
             if key == "action_normalization":
-                return None if val is None else str(val)
+                return "none" if val is None else str(val)
             found = _search(val)
             if found is not None:
                 return found
@@ -148,6 +180,46 @@ def _read_action_normalization_from_config(training_config: Any) -> str | None:
         dl_train = training_config.get("dataloader_train")
     else:
         dl_train = getattr(training_config, "dataloader_train", None)
+    if dl_train is None:
+        return None
+    return _search(dl_train)
+
+
+def _read_bool_from_dataloader_config(training_config: Any, key_name: str) -> bool | None:
+    """Recursively search ``dataloader_train`` for a boolean dataset knob."""
+    if training_config is None:
+        return None
+
+    def _search(obj: Any) -> bool | None:
+        items = None
+        if isinstance(obj, dict):
+            items = obj.items()
+        elif OmegaConf.is_config(obj):
+            try:
+                items = OmegaConf.to_container(obj, resolve=False).items()
+            except Exception:
+                items = None
+        if items is None:
+            return None
+        for key, val in items:
+            if key == key_name:
+                if isinstance(val, bool):
+                    return val
+                if isinstance(val, str):
+                    lowered = val.strip().lower()
+                    if lowered in {"1", "true", "yes", "y"}:
+                        return True
+                    if lowered in {"0", "false", "no", "n"}:
+                        return False
+                return bool(val)
+            found = _search(val)
+            if found is not None:
+                return found
+        return None
+
+    dl_train = training_config.get("dataloader_train") if isinstance(training_config, dict) else getattr(
+        training_config, "dataloader_train", None
+    )
     if dl_train is None:
         return None
     return _search(dl_train)
@@ -168,18 +240,23 @@ class RoboTwinPolicyService:
             "output_dir": args.output_dir or str(_DEFAULT_OUTPUT_DIR),
             "sampler": args.sampler,
         }
-        if args.experiment:
+        saved_config_file = _infer_training_config_file_from_checkpoint(checkpoint_path)
+        if saved_config_file is not None:
+            setup_overrides["config_file"] = saved_config_file
+            log.info(f"[robotwin-policy-server] using saved training config: {saved_config_file}")
+        elif args.experiment:
             setup_overrides["experiment"] = args.experiment
-            # The training TOML set the VAE path + disabled pretrained sub-weight fetches at
-            # launch; those don't apply when loading via --experiment, so inject them here.
-            # The frozen ViT / diffusion / action weights come from the trained DCP itself.
-            exp_overrides = [
-                "model.config.vlm_config.pretrained_weights.enabled=False",
-                "model.config.diffusion_expert_config.load_weights_from_pretrained=False",
-            ]
-            if args.vae_path:
-                exp_overrides.append(f"model.config.tokenizer.vae_path={args.vae_path}")
-            setup_overrides["experiment_overrides"] = exp_overrides
+
+        # The training TOML set the VAE path + disabled pretrained sub-weight fetches at
+        # launch; those don't apply when rebuilding a config for inference. The frozen
+        # ViT / diffusion / action weights come from the trained checkpoint itself.
+        exp_overrides = [
+            "model.config.vlm_config.pretrained_weights.enabled=False",
+            "model.config.diffusion_expert_config.load_weights_from_pretrained=False",
+        ]
+        if args.vae_path:
+            exp_overrides.append(f"model.config.tokenizer.vae_path={args.vae_path}")
+        setup_overrides["experiment_overrides"] = exp_overrides
         setup_args: OmniSetupArgs = OmniSetupOverrides.model_validate(setup_overrides).build_setup()
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
@@ -191,18 +268,11 @@ class RoboTwinPolicyService:
 
         # Build the SAME transform training used: ActionTransformPipeline with the
         # model's VLM tokenizer config (text tokenization requires it) + eval cfg_dropout=0.
-        training_config = _load_training_config(pipe.setup_args, checkpoint_path)
-        tok_cfg = self._extract_tokenizer_config(training_config)
-        self._transform = ActionTransformPipeline(
-            tokenizer_config=tok_cfg,
-            cfg_dropout_rate=0.0,
-            max_action_dim=64,
-            append_viewpoint_info=True,
-            append_duration_fps_timestamps=True,
-            append_resolution_info=True,
-            append_idle_frames=False,
-        )
-
+        # Raw DCP training outputs save config.yaml without the structured ``_type`` key,
+        # so prefer the OmegaConf-loaded YAML when it was found above.
+        training_config = _load_saved_training_config(saved_config_file)
+        if training_config is None:
+            training_config = _load_training_config(pipe.setup_args, checkpoint_path)
         self.resolution = str(args.resolution)
         if self.resolution not in _CONCAT_TARGET_HW_BY_RESOLUTION:
             raise ValueError(
@@ -212,6 +282,28 @@ class RoboTwinPolicyService:
         self._target_hw = _CONCAT_TARGET_HW_BY_RESOLUTION[self.resolution]
         self.conditioning_fps = float(args.conditioning_fps)
         self.action_chunk_size = int(args.action_chunk_size)
+        self.video_downsample_factor = self._resolve_video_downsample_factor(
+            args.downsample_video_frames,
+            int(args.video_downsample_factor),
+            training_config,
+        )
+        if self.action_chunk_size % self.video_downsample_factor != 0:
+            raise ValueError(
+                f"--action-chunk-size={self.action_chunk_size} must be divisible by "
+                f"video_downsample_factor={self.video_downsample_factor}"
+            )
+        self.video_fps = self.conditioning_fps / float(self.video_downsample_factor)
+        tok_cfg = self._extract_tokenizer_config(training_config)
+        self._transform = ActionTransformPipeline(
+            tokenizer_config=tok_cfg,
+            cfg_dropout_rate=0.0,
+            action_video_downsample_factor=self.video_downsample_factor,
+            max_action_dim=64,
+            append_viewpoint_info=True,
+            append_duration_fps_timestamps=True,
+            append_resolution_info=True,
+            append_idle_frames=False,
+        )
         self.guidance = float(args.guidance)
         self.num_steps = int(args.num_steps)
         self.shift = float(args.shift)
@@ -233,7 +325,8 @@ class RoboTwinPolicyService:
 
         log.info(
             f"[robotwin-policy-server] ready domain={_DOMAIN_NAME} id={self._domain_id} res={self.resolution} "
-            f"chunk={self.action_chunk_size} fps={self.conditioning_fps} guidance={self.guidance} "
+            f"chunk={self.action_chunk_size} video_downsample_factor={self.video_downsample_factor} "
+            f"video_fps={self.video_fps} action_fps={self.conditioning_fps} guidance={self.guidance} "
             f"num_steps={self.num_steps} shift={self.shift} action_normalization={self.action_normalization}"
         )
 
@@ -252,10 +345,54 @@ class RoboTwinPolicyService:
             return "none"
         return str(configured).lower()
 
+    @staticmethod
+    def _resolve_video_downsample_factor(
+        requested: str,
+        factor: int,
+        training_config: Any,
+    ) -> int:
+        requested = str(requested).lower()
+        if factor < 1:
+            raise ValueError(f"--video-downsample-factor must be >= 1, got {factor}")
+        if requested in {"1", "true", "yes", "y"}:
+            return factor
+        if requested in {"0", "false", "no", "n"}:
+            return 1
+        if requested != "auto":
+            raise ValueError(f"Unsupported --downsample-video-frames={requested!r}")
+        configured = _read_bool_from_dataloader_config(training_config, "downsample_video_frames")
+        if configured is None:
+            log.warning(
+                "[robotwin-policy-server] could not read downsample_video_frames from the training config; "
+                "assuming full 33-frame video path. Pass --downsample-video-frames explicitly to override."
+            )
+            return 1
+        return factor if configured else 1
+
     def _load_action_stats(self, stats_path: str | None) -> dict[str, torch.Tensor]:
         if stats_path:
             raw = load_action_stats(stats_path)
-            stats = {k: torch.from_numpy(v).float() for k, v in raw.items()}
+            if raw:
+                stats = {k: torch.from_numpy(v).float() for k, v in raw.items()}
+            else:
+                with open(stats_path, "r") as f:
+                    stats_json = json.load(f)
+                action_default = stats_json.get("action", {}).get("default", {})
+                key_map = {
+                    "mean": "global_mean",
+                    "std": "global_std",
+                    "min": "global_min",
+                    "max": "global_max",
+                    "q01": "global_q01",
+                    "q99": "global_q99",
+                }
+                stats = {
+                    key: torch.tensor(action_default[source_key], dtype=torch.float32)
+                    for key, source_key in key_map.items()
+                    if source_key in action_default
+                }
+                if not stats:
+                    raise ValueError(f"No supported action stats found in {stats_path}")
         else:
             # Fall back to the dataset's bundled stats (same file used in training).
             stats = RoboTwinLeRobotDataset.load_action_stats()
@@ -302,24 +439,42 @@ class RoboTwinPolicyService:
 
         concat = self._concat_view(head, left, right)  # [3,Hc,Wc] uint8
         _, hc, wc = concat.shape
-        t_frames = self.action_chunk_size + 1
+        t_frames = self.action_chunk_size // self.video_downsample_factor + 1
         video = torch.zeros((3, t_frames, hc, wc), dtype=torch.uint8)
         video[:, 0] = concat  # current obs; rest is generated
 
         action = torch.zeros((self.action_chunk_size + 1, _ACTION_DIM), dtype=torch.float32)
-        action[0] = torch.from_numpy(state)  # use_state: row0 = initial 14-D state
+        state_tensor = torch.from_numpy(state)
+        if self.action_normalization != "none":
+            assert self._norm_stats is not None
+            state_tensor = self._normalize_action(state_tensor)
+        action[0] = state_tensor  # use_state: row0 = initial 14-D state, in training action space
 
         sample = {
             "ai_caption": prompt,
             "video": video,
             "action": action,
-            "conditioning_fps": torch.tensor(self.conditioning_fps, dtype=torch.long),
+            "conditioning_fps": torch.tensor(self.video_fps, dtype=torch.float32),
+            "action_fps": torch.tensor(self.conditioning_fps, dtype=torch.float32),
             "mode": "policy",
             "domain_id": torch.tensor(self._domain_id, dtype=torch.long),
             "viewpoint": "concat_view",
             "additional_view_description": _CONCAT_VIEW_DESCRIPTION,
         }
         return self._transform(sample, self.resolution)
+
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        assert self._norm_stats is not None
+        stats = {key: value.to(device=action.device, dtype=action.dtype) for key, value in self._norm_stats.items()}
+        if self.action_normalization == "meanstd":
+            return ((action - stats["mean"]) / stats["std"].clamp(min=1e-8)).clamp(-5.0, 5.0)
+        if self.action_normalization == "minmax":
+            lo, hi = stats["min"], stats["max"]
+            return 2.0 * (action - lo) / (hi - lo).clamp(min=1e-8) - 1.0
+        if self.action_normalization == "quantile":
+            q01, q99 = stats["q01"], stats["q99"]
+            return 2.0 * (action - q01) / (q99 - q01).clamp(min=1e-8) - 1.0
+        raise ValueError(f"Unsupported action normalization for conditioning state: {self.action_normalization!r}")
 
     def infer(self, obs: dict[str, Any]) -> np.ndarray:
         sample = self._build_sample(obs)
@@ -363,15 +518,26 @@ def _make_handler(service: RoboTwinPolicyService) -> type[socketserver.BaseReque
                     return
                 length = int.from_bytes(header, "big")
                 body = _recv_n(sock, length)
+                t_body_received = time.perf_counter()
                 req = _decode(json.loads(body.decode("utf-8")))
+                t_req_decoded = time.perf_counter()
                 cmd = req.get("cmd", "infer")
+                timing: dict[str, float] | None = None
                 try:
                     if cmd == "ping":
                         resp: dict[str, Any] = {"ok": True}
                     elif cmd == "reset":
                         resp = {"ok": True}
                     elif cmd == "infer":
-                        resp = {"action": service.infer(req)}
+                        t_infer_start = time.perf_counter()
+                        action = service.infer(req)
+                        t_action_ready = time.perf_counter()
+                        timing = {
+                            "server_request_decode_s": t_req_decoded - t_body_received,
+                            "server_obs_to_action_s": t_action_ready - t_infer_start,
+                            "server_request_to_action_s": t_action_ready - t_body_received,
+                        }
+                        resp = {"action": action, "_server_timing": timing}
                     else:
                         resp = {"error": f"unknown cmd {cmd!r}"}
                 except Exception as exc:  # noqa: BLE001
@@ -407,6 +573,21 @@ def main() -> None:
     p.add_argument("--resolution", default="384x320")
     p.add_argument("--conditioning-fps", type=float, default=30.0)
     p.add_argument("--action-chunk-size", type=int, default=32)
+    p.add_argument(
+        "--downsample-video-frames",
+        default="auto",
+        choices=["auto", "true", "false", "1", "0", "yes", "no", "y", "n"],
+        help=(
+            "Whether to use the FastWAM-style 4x video-only downsampling at eval. "
+            "'auto' reads downsample_video_frames from the training config."
+        ),
+    )
+    p.add_argument(
+        "--video-downsample-factor",
+        type=int,
+        default=4,
+        help="Video-only temporal downsample factor used when --downsample-video-frames is true.",
+    )
     p.add_argument("--guidance", type=float, default=3.0)
     p.add_argument("--num-steps", type=int, default=4)
     p.add_argument("--shift", type=float, default=5.0)

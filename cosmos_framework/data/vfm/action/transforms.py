@@ -239,6 +239,7 @@ def build_sequence_plan_from_mode(
     has_text: bool = True,
     video_temporal_downsample: int = 4,
     num_history_actions: int = 0,
+    action_video_downsample_factor: int = 1,
 ) -> SequencePlan:
     """Build a SequencePlan based on the training mode.
 
@@ -257,6 +258,10 @@ def build_sequence_plan_from_mode(
         video_temporal_downsample: Temporal downsampling factor of the video
             tokenizer. Used to compute condition frame indexes for inverse
             dynamics mode. Defaults to 4.
+        action_video_downsample_factor: Number of action-rate transitions
+            represented by one video transition. Defaults to 1. Use 4 for the
+            FastWAM-style RoboTwin ablation where video frames are
+            ``0,4,8,...,32`` but actions remain at the original 32-step rate.
 
     Returns:
         SequencePlan instance with appropriate settings.
@@ -280,6 +285,11 @@ def build_sequence_plan_from_mode(
     valid_modes = ["image2video", "forward_dynamics", "inverse_dynamics", "policy"]
     if mode not in valid_modes:
         raise ValueError(f"Invalid mode: {mode!r}. Must be one of {valid_modes}")
+    action_video_downsample_factor = int(action_video_downsample_factor)
+    if action_video_downsample_factor < 1:
+        raise ValueError(
+            f"action_video_downsample_factor must be >= 1, got {action_video_downsample_factor}"
+        )
 
     # Determine if action should be included based on mode
     # image2video mode: no action (pure image-to-video generation)
@@ -304,17 +314,27 @@ def build_sequence_plan_from_mode(
     base_action_length = action_length - num_history_actions
     if mode == "forward_dynamics":
         condition_frame_indexes_action = list(range(action_length))
-    # This currently assumes that the action length is the same as the video length - 1
-    # and if action length is the same as the video length, then the first action is the conditioning action
-    elif base_action_length == video_length - 1:
+    # If the action stream includes exactly one action per video transition,
+    # only history actions are conditioning. With a downsampled video stream,
+    # there are ``action_video_downsample_factor`` action-rate steps per video
+    # transition. If the action stream additionally includes the current state
+    # row, that first row is conditioning too.
+    elif base_action_length == (video_length - 1) * action_video_downsample_factor:
         condition_frame_indexes_action = list(range(num_history_actions))
-    elif base_action_length == video_length:
+    elif base_action_length == ((video_length - 1) * action_video_downsample_factor) + 1:
         condition_frame_indexes_action = list(range(num_history_actions + 1))
 
-    if base_action_length == video_length - 1:
+    if base_action_length == (video_length - 1) * action_video_downsample_factor:
         action_start_frame_offset = 1 - num_history_actions
-    if base_action_length == video_length:
+    elif base_action_length == ((video_length - 1) * action_video_downsample_factor) + 1:
         action_start_frame_offset = -num_history_actions
+    else:
+        raise ValueError(
+            "Unsupported action/video lengths for sequence plan: "
+            f"mode={mode!r}, video_length={video_length}, action_length={action_length}, "
+            f"num_history_actions={num_history_actions}, "
+            f"action_video_downsample_factor={action_video_downsample_factor}"
+        )
 
     return SequencePlan(
         has_text=has_text,
@@ -476,9 +496,15 @@ class ActionTransformPipeline:
         append_idle_frames: bool = False,
         idle_frames_dropout: float = 0.05,
         format_prompt_as_json: bool = False,
+        action_video_downsample_factor: int = 1,
     ) -> None:
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
+        self.action_video_downsample_factor: int = int(action_video_downsample_factor)
+        if self.action_video_downsample_factor < 1:
+            raise ValueError(
+                f"action_video_downsample_factor must be >= 1, got {self.action_video_downsample_factor}"
+            )
         self.max_action_dim: int = max_action_dim
         self.action_channel_masking: bool = action_channel_masking
         self.action_processor: ActionProcessor = ActionProcessor(
@@ -657,6 +683,7 @@ class ActionTransformPipeline:
             action_length=action_length,
             video_temporal_downsample=self.video_temporal_downsample,
             num_history_actions=num_history_actions,
+            action_video_downsample_factor=self.action_video_downsample_factor,
         )
         data_dict["sequence_plan"] = sequence_plan
 

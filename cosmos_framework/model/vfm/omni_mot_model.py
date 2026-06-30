@@ -2882,7 +2882,10 @@ class OmniMoTModel(ImaginaireModel):
         if isinstance(fps_raw, list):
             fps_raw = torch.stack(fps_raw).flatten()  # list of scalar tensors -> (B,)
         fps_vision = fps_raw.to(**self.tensor_kwargs) if fps_raw is not None else None
-        fps_action = fps_raw.to(**self.tensor_kwargs) if fps_raw is not None else None
+        action_fps_raw = data_batch.get("action_fps", fps_raw)
+        if isinstance(action_fps_raw, list):
+            action_fps_raw = torch.stack(action_fps_raw).flatten()  # list of scalar tensors -> (B,)
+        fps_action = action_fps_raw.to(**self.tensor_kwargs) if action_fps_raw is not None else None
 
         # Sound FPS for RoPE alignment (constant, from config)
         if x0_tokens_sound is not None:

@@ -150,6 +150,8 @@ def _hf_download(cmd_args: list[str]) -> str:
         "uvx",
         "--with",
         "click",
+        "--with",
+        "socksio",
         f"hf@{HF_VERSION}",
         "download",
         "--format=json",

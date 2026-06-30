@@ -11,6 +11,8 @@ embodiment:
     default; set ``action_normalization="meanstd"`` for the z-score ablation
     (per-joint stats in ``stats/robotwin_lerobot_stats.json``).
   * ``use_state=True`` prepends the initial observed 14D state -> ``(chunk+1, 14)``.
+  * Optional FastWAM-style video-only 4x temporal downsampling keeps frames
+    ``0,4,8,...,32`` while the action tensor remains ``chunk+1`` rows.
   * 3 cameras -> ``concat_view``: head (``cam_high``) full-width on top;
     left/right wrists resized to half size and concatenated on the bottom row.
     The resulting canvas is then resized to the selected no-padding RoboTwin
@@ -86,6 +88,7 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         action_normalization: str | None = None,
         use_image_augmentation: bool = False,
         target_resolution: str = "384x320",
+        video_downsample_factor: int = 1,
     ) -> None:
         if viewpoint != "concat_view":
             raise NotImplementedError("RoboTwinLeRobotDataset only supports concat_view.")
@@ -122,6 +125,14 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
 
         self._use_state = bool(use_state)
         self._use_image_augmentation = bool(use_image_augmentation)
+        self._video_downsample_factor = int(video_downsample_factor)
+        if self._video_downsample_factor < 1:
+            raise ValueError(f"video_downsample_factor must be >= 1, got {self._video_downsample_factor}")
+        if self._chunk_length % self._video_downsample_factor != 0:
+            raise ValueError(
+                f"chunk_length={self._chunk_length} must be divisible by "
+                f"video_downsample_factor={self._video_downsample_factor}"
+            )
         if target_resolution not in _CONCAT_TARGET_HW_BY_RESOLUTION:
             raise ValueError(
                 f"Unsupported RoboTwin target_resolution={target_resolution!r}; "
@@ -290,7 +301,7 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         video = self._load_concat_video(episode, observation_rows)
         raw_action = self._build_joint_action(observation_rows)
 
-        return self._build_result(
+        result = self._build_result(
             mode=mode,
             video=video,
             action=raw_action,
@@ -301,6 +312,10 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
                 "left-arm wrist on the left and right-arm wrist on the right."
             ),
         )
+        if self._video_downsample_factor > 1:
+            result["conditioning_fps"] = torch.tensor(self._fps / self._video_downsample_factor, dtype=torch.float32)
+            result["action_fps"] = torch.tensor(self._fps, dtype=torch.float32)
+        return result
 
     def _load_lerobot_v21_rows(self, episode: dict[str, Any], start: int, length: int) -> list[dict[str, Any]]:
         table = pq.read_table(
@@ -325,7 +340,8 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         episode: dict[str, Any],
         observation_rows: list[dict[str, Any]],
     ) -> torch.Tensor:
-        timestamps = [float(row["timestamp"]) for row in observation_rows]
+        video_rows = observation_rows[:: self._video_downsample_factor]
+        timestamps = [float(row["timestamp"]) for row in video_rows]
         frames_by_view = {
             name: decode_video_frames(
                 self._video_path(episode, video_key),
