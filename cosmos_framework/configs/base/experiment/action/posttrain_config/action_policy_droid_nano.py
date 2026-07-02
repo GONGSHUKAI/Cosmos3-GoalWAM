@@ -21,15 +21,14 @@ import copy
 
 from hydra.core.config_store import ConfigStore
 
-from cosmos_framework.utils.lazy_config import LazyCall as L
-from cosmos_framework.utils.lazy_config import LazyDict
-
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
+from cosmos_framework.data.vfm.action.datasets.action_sft_dataset import get_action_droid_sft_dataset
 from cosmos_framework.data.vfm.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
 )
-from cosmos_framework.data.vfm.action.datasets.action_sft_dataset import get_action_droid_sft_dataset
+from cosmos_framework.utils.lazy_config import LazyCall as L
+from cosmos_framework.utils.lazy_config import LazyDict
 
 cs = ConfigStore.instance()
 
@@ -117,7 +116,6 @@ action_policy_droid_nano = LazyDict(
             ddp=dict(broadcast_buffers=True, find_unused_parameters=False, static_graph=True),
             grad_scaler_args=dict(enabled=False),
             callbacks=dict(
-                dataloader_speed=dict(every_n=100, save_s3=False, step_size=1),
                 device_monitor=dict(
                     every_n=200, log_memory_detail=True, save_s3=False, step_size=1, upload_every_n_mul=5
                 ),

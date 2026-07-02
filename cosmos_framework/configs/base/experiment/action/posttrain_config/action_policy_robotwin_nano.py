@@ -25,7 +25,6 @@ import copy
 
 from hydra.core.config_store import ConfigStore
 
-from cosmos_framework.callbacks.dataloader_speed import DataloaderSpeedCallback
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
 from cosmos_framework.data.vfm.action.datasets.action_sft_dataset import get_action_robotwin_sft_dataset
 from cosmos_framework.data.vfm.joint_dataloader import (
@@ -121,7 +120,6 @@ action_policy_robotwin_nano = LazyDict(
             ddp=dict(broadcast_buffers=True, find_unused_parameters=False, static_graph=True),
             grad_scaler_args=dict(enabled=False),
             callbacks=dict(
-                dataloader_speed=L(DataloaderSpeedCallback)(every_n=100, step_size=1, log_to_wandb=True),
                 device_monitor=dict(
                     every_n=200, log_memory_detail=True, save_s3=False, step_size=1, upload_every_n_mul=5
                 ),
@@ -218,7 +216,6 @@ action_policy_robotwin_nano = LazyDict(
                             # augmentation path intentionally jitters each raw camera before concat.
                             use_offline_concat=True,
                             use_offline_concat_with_augmentation=False,
-                            emit_timing=False,
                             viewpoint="concat_view",  # head 256x320 (top) + L/R wrists 128x160 each (bottom)
                             resolution="384x320",  # exact RoboTwin concat bucket; no square padding
                             max_action_dim="${model.config.max_action_dim}",

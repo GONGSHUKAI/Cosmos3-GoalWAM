@@ -33,15 +33,14 @@ from __future__ import annotations
 import json
 import os
 import random
-import time
 from typing import Any, Iterable, Iterator, Optional
 
 import torch
 import torch.distributed as dist
 import torch.utils.data
 
-from cosmos_framework.utils.lazy_config import instantiate
 from cosmos_framework.utils import log
+from cosmos_framework.utils.lazy_config import instantiate
 
 
 def _wrap_augmentor_func_as_generator(func, data):
@@ -62,34 +61,12 @@ def _run_augmentor_chain(data, augmentations):
     at OmegaConf resolver registration time. We inline the few-line wrapper so the
     local SFT loader needs only the OSS lazy_config module.
     """
-    def _stamp_pre_aug(upstream):
-        for sample in upstream:
-            sample["_pre_aug_time"] = time.monotonic()
-            sample["_aug_step_last"] = sample["_pre_aug_time"]
-            yield sample
-
-    def _checkpoint(upstream, step_name):
-        for sample in upstream:
-            now = time.monotonic()
-            last = sample.get("_aug_step_last", now)
-            sample.setdefault("_aug_step_times", {})[step_name] = now - last
-            sample["_aug_step_last"] = now
-            yield sample
-
-    data = _stamp_pre_aug(data)
     for aug_fn in augmentations:
-        name = getattr(aug_fn, "__name__", None) or type(aug_fn).__name__
         if getattr(aug_fn, "is_generator", False):
             data = aug_fn(data)
         else:
             data = _wrap_augmentor_func_as_generator(aug_fn, data)
-        data = _checkpoint(data, name)
-    for sample in data:
-        sample.pop("_aug_step_last", None)
-        pre = sample.pop("_pre_aug_time", None)
-        if pre is not None:
-            sample["_aug_time"] = time.monotonic() - pre
-        yield sample
+    yield from data
 
 
 class _UrlObj:

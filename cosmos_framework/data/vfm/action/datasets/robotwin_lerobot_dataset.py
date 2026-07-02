@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -98,7 +97,6 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         video_downsample_factor: int = 1,
         use_offline_concat: bool = True,
         use_offline_concat_with_augmentation: bool = False,
-        emit_timing: bool = False,
     ) -> None:
         if viewpoint != "concat_view":
             raise NotImplementedError("RoboTwinLeRobotDataset only supports concat_view.")
@@ -154,7 +152,6 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         self._use_offline_concat_with_augmentation = bool(use_offline_concat_with_augmentation)
         self._offline_concat_key = self._resolve_offline_concat_key()
         self._image_augmentor: T.Compose | None = None
-        self._emit_timing = bool(emit_timing)
 
         # Episode boundaries over the base ``_rows`` (sorted by global ``index``; v3.0
         # orders frames by episode, so episodes are contiguous blocks). Valid windows
@@ -288,17 +285,6 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         return int(self._valid_cum[-1]) if self._valid_cum.size else 0
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        sample_t0 = time.monotonic() if self._emit_timing else None
-        step_times: dict[str, float] = {}
-
-        def checkpoint(name: str, start: float | None) -> float | None:
-            if start is None:
-                return None
-            now = time.monotonic()
-            step_times[name] = step_times.get(name, 0.0) + (now - start)
-            return now
-
-        step_t0 = sample_t0
         mode = self._choose_mode()
         idx = int(idx)
         # Map the flat sample index to a within-episode frame window.
@@ -321,11 +307,8 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
             task = self._tasks[int(observation_rows[0]["task_index"])]
             ai_caption = random.choice(task.split(" | "))
 
-        step_t0 = checkpoint("rows", step_t0)
         video = self._load_concat_video(episode, observation_rows)
-        step_t0 = checkpoint("video_decode_resize_aug", step_t0)
         raw_action = self._build_joint_action(observation_rows)
-        step_t0 = checkpoint("action", step_t0)
 
         result = self._build_result(
             mode=mode,
@@ -341,17 +324,20 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         if self._video_downsample_factor > 1:
             result["conditioning_fps"] = torch.tensor(self._fps / self._video_downsample_factor, dtype=torch.float32)
             result["action_fps"] = torch.tensor(self._fps, dtype=torch.float32)
-        if sample_t0 is not None:
-            step_t0 = checkpoint("build_result", step_t0)
-            result["_sample_time"] = time.monotonic() - sample_t0
-            result["_aug_time"] = sum(step_times.values())
-            result["_aug_step_times"] = step_times
         return result
 
     def _load_lerobot_v21_rows(self, episode: dict[str, Any], start: int, length: int) -> list[dict[str, Any]]:
         table = pq.read_table(
             episode["data_path"],
-            columns=[_STATE_FEATURE, _ACTION_FEATURE, "timestamp", "frame_index", "episode_index", "index", "task_index"],
+            columns=[
+                _STATE_FEATURE,
+                _ACTION_FEATURE,
+                "timestamp",
+                "frame_index",
+                "episode_index",
+                "index",
+                "task_index",
+            ],
         )
         return table.slice(start, length).to_pylist()
 

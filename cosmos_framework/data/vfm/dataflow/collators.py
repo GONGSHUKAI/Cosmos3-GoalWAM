@@ -27,15 +27,6 @@ class DefaultBatchCollator(BatchCollator):
 # This produces list[list[Tensor]] for _MULTI_ITEM_KEYS (not flat list[Tensor]).
 # ---------------------------------------------------------------------------
 
-_TIMING_KEYS = {"_sample_time", "_aug_time", "_pre_aug_time", "_aug_step_times"}
-_BATCH_TIMING_KEYS = {
-    "_worker_batch_time",
-    "_worker_aug_time",
-    "_worker_io_time",
-    "_worker_aug_step_times",
-    "_worker_id",
-}
-
 # Verbatim copy of JointDataLoader._MULTI_ITEM_KEYS
 _MULTI_ITEM_KEYS = {"text_token_ids", "images", "video", "action", "sound"}
 
@@ -79,7 +70,6 @@ def _vfm_inner_collate(batch):
     # Handle standard list of samples
     elem = batch[0]
     if isinstance(elem, dict):
-
         # Some Action datasets add optional metadata keys (for example
         # ``additional_view_description`` for concat-view captions) only for a
         # subset of samples.  PyTorch can batch such samples together when
@@ -91,8 +81,6 @@ def _vfm_inner_collate(batch):
         result = {}
         keys = set().union(*(d.keys() for d in batch))
         for key in keys:
-            if key in _TIMING_KEYS:
-                continue
             values = [d.get(key) for d in batch]
             if any(value is None for value in values):
                 # Sparse data keys keep their None placeholders to preserve
@@ -105,38 +93,15 @@ def _vfm_inner_collate(batch):
                 result[key] = values
             else:
                 result[key] = default_collate(values)
-        result.update(_aggregate_worker_timing(batch))
         return result
     else:
         return default_collate(batch)
-
-
-def _aggregate_worker_timing(samples: list[dict]) -> dict:
-    """Extract per-sample timing keys, aggregate into per-batch scalars."""
-    info: dict[str, float | int] = {}
-    if "_sample_time" in samples[0]:
-        info["_worker_batch_time"] = sum(s.get("_sample_time", 0.0) for s in samples)
-    if "_aug_time" in samples[0]:
-        aug_total = sum(s.get("_aug_time", 0.0) for s in samples)
-        info["_worker_aug_time"] = aug_total
-        if "_worker_batch_time" in info:
-            info["_worker_io_time"] = info["_worker_batch_time"] - aug_total
-    if "_aug_step_times" in samples[0]:
-        agg: dict[str, float] = {}
-        for s in samples:
-            for step_name, t in s.get("_aug_step_times", {}).items():
-                agg[step_name] = agg.get(step_name, 0.0) + t
-        info["_worker_aug_step_times"] = agg
-    worker_info = torch.utils.data.get_worker_info()
-    info["_worker_id"] = worker_info.id if worker_info is not None else 0
-    return info
 
 
 def _split_one(batch: dict) -> dict:
     """Port of _get_next_sample split rules for i=0 (verbatim from joint_dataloader.py lines 470-490).
 
     Splitting rules:
-        - _BATCH_TIMING_KEYS: passed through as-is.
         - _MULTI_ITEM_KEYS with list value: elem = v[0]; if elem is a list → sample[k]=elem,
           else → sample[k]=v[0:1] (single-element list wrapping the tensor).
         - Other list values: sample[k] = v[0] (bare element, direct-indexed).
@@ -144,9 +109,7 @@ def _split_one(batch: dict) -> dict:
     """
     sample = {}
     for k, v in batch.items():
-        if k in _BATCH_TIMING_KEYS:
-            sample[k] = v
-        elif isinstance(v, list) and k in _MULTI_ITEM_KEYS:
+        if isinstance(v, list) and k in _MULTI_ITEM_KEYS:
             elem = v[0]
             sample[k] = elem if isinstance(elem, list) else v[0:1]
         elif isinstance(v, list):
@@ -159,10 +122,7 @@ def _split_one(batch: dict) -> dict:
 def _accumulate(output_batch: dict, output: dict) -> None:
     """Port of _update_output_batch from joint_dataloader.py lines 405-418."""
     for key, value in output.items():
-        if key in _BATCH_TIMING_KEYS:
-            if key not in output_batch:
-                output_batch[key] = value
-        elif key in _FLATTEN_LIST_KEYS and isinstance(value, list):
+        if key in _FLATTEN_LIST_KEYS and isinstance(value, list):
             if key not in output_batch:
                 output_batch[key] = value
             else:
@@ -190,7 +150,6 @@ class VFMListCollator(BatchCollator):
       - ``image_size`` (``_FLATTEN_LIST_KEYS``): flat ``list[Tensor]``
         (extended, not appended).
       - Non-list tensor keys: ``list[Tensor(1,...)]``.
-      - ``_BATCH_TIMING_KEYS``: set once from the first sample.
 
     Implementation: for each sample, inner-collate at batch_size=1 via
     ``_vfm_inner_collate`` (verbatim ``custom_collate_fn``), split
@@ -205,7 +164,7 @@ class VFMListCollator(BatchCollator):
         # list / tensor rules, then _update_output_batch-accumulate across the group.
         output_batch: dict = {}
         for s in samples:
-            collated = _vfm_inner_collate([s])      # verbatim custom_collate_fn copy
-            split = _split_one(collated)            # i=0 split (rules from _get_next_sample)
-            _accumulate(output_batch, split)        # _update_output_batch copy
+            collated = _vfm_inner_collate([s])  # verbatim custom_collate_fn copy
+            split = _split_one(collated)  # i=0 split (rules from _get_next_sample)
+            _accumulate(output_batch, split)  # _update_output_batch copy
         return output_batch

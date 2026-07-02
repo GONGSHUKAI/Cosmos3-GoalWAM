@@ -20,15 +20,6 @@ from cosmos_framework.model.vfm.tokenizers.uniae.frame_math import (
 from cosmos_framework.utils import log
 from cosmos_framework.utils.lazy_config import instantiate
 
-_TIMING_KEYS = {"_sample_time", "_aug_time", "_pre_aug_time", "_aug_step_times"}
-_BATCH_TIMING_KEYS = {
-    "_worker_batch_time",
-    "_worker_aug_time",
-    "_worker_io_time",
-    "_worker_aug_step_times",
-    "_worker_id",
-}
-
 
 def custom_collate_fn(batch):
     """
@@ -76,8 +67,6 @@ def custom_collate_fn(batch):
         result = {}
         keys = set().union(*(d.keys() for d in batch))
         for key in keys:
-            if key in _TIMING_KEYS:
-                continue
             values = [d.get(key) for d in batch]
             if key == "action_processing_record":
                 result[key] = values
@@ -93,31 +82,9 @@ def custom_collate_fn(batch):
                 result[key] = values
             else:
                 result[key] = default_collate(values)
-        result.update(_aggregate_worker_timing(batch))
         return result
     else:
         return default_collate(batch)
-
-
-def _aggregate_worker_timing(samples: list[dict]) -> dict:
-    """Extract per-sample timing keys, aggregate into per-batch scalars."""
-    info: dict[str, float | int] = {}
-    if "_sample_time" in samples[0]:
-        info["_worker_batch_time"] = sum(s.get("_sample_time", 0.0) for s in samples)
-    if "_aug_time" in samples[0]:
-        aug_total = sum(s.get("_aug_time", 0.0) for s in samples)
-        info["_worker_aug_time"] = aug_total
-        if "_worker_batch_time" in info:
-            info["_worker_io_time"] = info["_worker_batch_time"] - aug_total
-    if "_aug_step_times" in samples[0]:
-        agg: dict[str, float] = {}
-        for s in samples:
-            for step_name, t in s.get("_aug_step_times", {}).items():
-                agg[step_name] = agg.get(step_name, 0.0) + t
-        info["_worker_aug_step_times"] = agg
-    worker_info = torch.utils.data.get_worker_info()
-    info["_worker_id"] = worker_info.id if worker_info is not None else 0
-    return info
 
 
 @dataclass
@@ -342,9 +309,7 @@ class JointDataLoader(webdataset.WebLoader):
             for j in range(batch_size):
                 sample = {}
                 for k, v in batch.items():
-                    if k in _BATCH_TIMING_KEYS:
-                        sample[k] = v
-                    elif isinstance(v, list) and k in self._MULTI_ITEM_KEYS:
+                    if isinstance(v, list) and k in self._MULTI_ITEM_KEYS:
                         elem = v[j]
                         if isinstance(elem, list):
                             sample[k] = elem
@@ -454,20 +419,7 @@ class JointDataLoader(webdataset.WebLoader):
 
     def _update_output_batch(self, output_batch: dict, output: dict):
         for key, value in output.items():
-            if key in _BATCH_TIMING_KEYS:
-                if key == "_worker_aug_step_times":
-                    if key not in output_batch:
-                        output_batch[key] = {}
-                    for step_name, step_value in value.items():
-                        output_batch[key][step_name] = output_batch[key].get(step_name, 0.0) + float(step_value)
-                elif key == "_worker_id":
-                    output_batch.setdefault(key, [])
-                    output_batch[key].append(value)
-                elif key not in output_batch:
-                    output_batch[key] = value
-                else:
-                    output_batch[key] += value
-            elif key in self._FLATTEN_LIST_KEYS and isinstance(value, list):
+            if key in self._FLATTEN_LIST_KEYS and isinstance(value, list):
                 if key not in output_batch:
                     output_batch[key] = value
                 else:
@@ -530,9 +482,7 @@ class JointDataLoader(webdataset.WebLoader):
             for i in range(batch_size):
                 sample = {}
                 for k, v in batch.items():
-                    if k in _BATCH_TIMING_KEYS:
-                        sample[k] = v
-                    elif isinstance(v, list) and k in self._MULTI_ITEM_KEYS:
+                    if isinstance(v, list) and k in self._MULTI_ITEM_KEYS:
                         # For multi-item keys (images, video, etc.), the collated
                         # value is a list with one element per sample.  If the element
                         # is itself a list (e.g. image editing: [src, tgt]), use v[i]

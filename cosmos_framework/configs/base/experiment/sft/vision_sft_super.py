@@ -149,7 +149,6 @@ vision_sft_super = LazyDict(
                     enabled=False,
                     warmup_resolutions=["256", "480", "720"],
                 ),
-                dataloader_speed=dict(every_n=100, save_s3=False, step_size=1),
                 device_monitor=dict(
                     every_n=200,
                     log_memory_detail=True,
