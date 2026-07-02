@@ -12,13 +12,13 @@ import torch
 import webdataset
 from torch.utils.data.dataloader import default_collate
 
-from cosmos_framework.utils.lazy_config import instantiate
-from cosmos_framework.utils import log
 from cosmos_framework.model.vfm.tokenizers.uniae.frame_math import (
     get_uniae_chunk_frames,
     get_uniae_latent_num_frames,
     normalize_uniae_chunk_frames,
 )
+from cosmos_framework.utils import log
+from cosmos_framework.utils.lazy_config import instantiate
 
 _TIMING_KEYS = {"_sample_time", "_aug_time", "_pre_aug_time", "_aug_step_times"}
 _BATCH_TIMING_KEYS = {
@@ -455,8 +455,18 @@ class JointDataLoader(webdataset.WebLoader):
     def _update_output_batch(self, output_batch: dict, output: dict):
         for key, value in output.items():
             if key in _BATCH_TIMING_KEYS:
-                if key not in output_batch:
+                if key == "_worker_aug_step_times":
+                    if key not in output_batch:
+                        output_batch[key] = {}
+                    for step_name, step_value in value.items():
+                        output_batch[key][step_name] = output_batch[key].get(step_name, 0.0) + float(step_value)
+                elif key == "_worker_id":
+                    output_batch.setdefault(key, [])
+                    output_batch[key].append(value)
+                elif key not in output_batch:
                     output_batch[key] = value
+                else:
+                    output_batch[key] += value
             elif key in self._FLATTEN_LIST_KEYS and isinstance(value, list):
                 if key not in output_batch:
                     output_batch[key] = value
@@ -881,8 +891,7 @@ class PackingDataLoader(JointDataLoader):
         ds_name = getattr(inner, "dataset_name", self.dataset_name_list[0])
 
         while True:
-            current_sequence_length = 0
-            num_samples = 0
+            metrics = _PackingMetrics()
             output_batch: dict = {}
 
             skipped_samples: deque = deque()
@@ -891,22 +900,28 @@ class PackingDataLoader(JointDataLoader):
             lookahead_count = 0
 
             while True:
-                if self.max_samples_per_batch is not None and num_samples >= self.max_samples_per_batch:
+                if self.max_samples_per_batch is not None and metrics.num_samples >= self.max_samples_per_batch:
                     break
 
                 if len(output_batch) > 0 and lookahead_count >= lookahead_limit:
                     break
 
+                had_buffer = len(self.buffers[0]) > 0
                 try:
                     output = self._get_next_sample(0)
                 except StopIteration:
                     break
 
+                if had_buffer:
+                    metrics.from_buffer += 1
+                else:
+                    metrics.from_workers += 1
+
                 num_tokens_in_current_sample = self._compute_num_tokens_per_sample(output)
 
                 if (
                     self.max_sequence_length is not None
-                    and current_sequence_length + num_tokens_in_current_sample >= self.max_sequence_length
+                    and metrics.current_sequence_length + num_tokens_in_current_sample >= self.max_sequence_length
                 ):
                     if len(output_batch) == 0:
                         # This case happens when current_sequence_length = 0 and num_tokens_in_current_sample > self.max_sequence_length
@@ -915,14 +930,15 @@ class PackingDataLoader(JointDataLoader):
                             f"PackingDataLoader: Discarding oversized sample with {num_tokens_in_current_sample} tokens. Max sequence length: {self.max_sequence_length}",
                             rank0_only=False,
                         )
+                        metrics.dropped_count += 1
                         continue
 
                     skipped_samples.append(output)
                     lookahead_count += 1
                     continue
 
-                current_sequence_length += num_tokens_in_current_sample
-                num_samples += 1
+                metrics.current_sequence_length += num_tokens_in_current_sample
+                metrics.num_samples += 1
                 output["dataset_name"] = ds_name
                 self._update_output_batch(output_batch, output)
 
@@ -932,6 +948,7 @@ class PackingDataLoader(JointDataLoader):
             if len(output_batch) == 0:
                 return
 
+            metrics.attach_to(output_batch, buffer_size=len(self.buffers[0]))
             self.global_id += 1
             yield output_batch
 

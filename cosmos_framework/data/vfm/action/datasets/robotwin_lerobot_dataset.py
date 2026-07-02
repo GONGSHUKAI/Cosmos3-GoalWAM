@@ -29,7 +29,9 @@ base ``_rows`` directly rather than the compact-array path DROID uses for its
 from __future__ import annotations
 
 import json
+import os
 import random
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +57,7 @@ _IMAGE_FEATURES = {
     "left": "observation.images.cam_left_wrist",
     "right": "observation.images.cam_right_wrist",
 }
+_OFFLINE_CONCAT_FEATURE_PREFIX = "observation.images.concat_view"
 # 14D joint vector lives in a single ``action`` column; the per-frame observed
 # state is an identical 14D ``observation.state`` column (the RoboTwin converter
 # sets both = ``joint_action/vector``). Gripper is NOT flipped (unlike DROID): we
@@ -70,6 +73,10 @@ _CONCAT_TARGET_HW_BY_RESOLUTION = {
     "384x320": (384, 320),
     "736x640": (736, 640),
 }
+
+
+def _offline_concat_feature_key(target_resolution: str) -> str:
+    return f"{_OFFLINE_CONCAT_FEATURE_PREFIX}_{target_resolution}"
 
 
 class RoboTwinLeRobotDataset(ActionBaseDataset):
@@ -89,6 +96,9 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         use_image_augmentation: bool = False,
         target_resolution: str = "384x320",
         video_downsample_factor: int = 1,
+        use_offline_concat: bool = True,
+        use_offline_concat_with_augmentation: bool = False,
+        emit_timing: bool = False,
     ) -> None:
         if viewpoint != "concat_view":
             raise NotImplementedError("RoboTwinLeRobotDataset only supports concat_view.")
@@ -140,7 +150,11 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
             )
         self._target_resolution = target_resolution
         self._target_hw = _CONCAT_TARGET_HW_BY_RESOLUTION[target_resolution]
+        self._use_offline_concat = bool(use_offline_concat)
+        self._use_offline_concat_with_augmentation = bool(use_offline_concat_with_augmentation)
+        self._offline_concat_key = self._resolve_offline_concat_key()
         self._image_augmentor: T.Compose | None = None
+        self._emit_timing = bool(emit_timing)
 
         # Episode boundaries over the base ``_rows`` (sorted by global ``index``; v3.0
         # orders frames by episode, so episodes are contiguous blocks). Valid windows
@@ -232,11 +246,9 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
 
     @classmethod
     def _stats_path(cls) -> Path:
-        # Only consulted when action_normalization is not None. The default recipe
-        # uses raw joint values (None). For the normalization ablation
-        # (action_normalization="meanstd"), the bundled stats/robotwin_lerobot_stats.json
-        # holds the 14-D action mean/std/min/max for place_a2b_left (550 episodes);
-        # point this elsewhere for a different RoboTwin dataset.
+        override = os.environ.get("ROBOTWIN_ACTION_STATS_PATH")
+        if override:
+            return Path(override)
         return _NORMALIZER_PATH
 
     @classmethod
@@ -276,6 +288,17 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         return int(self._valid_cum[-1]) if self._valid_cum.size else 0
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample_t0 = time.monotonic() if self._emit_timing else None
+        step_times: dict[str, float] = {}
+
+        def checkpoint(name: str, start: float | None) -> float | None:
+            if start is None:
+                return None
+            now = time.monotonic()
+            step_times[name] = step_times.get(name, 0.0) + (now - start)
+            return now
+
+        step_t0 = sample_t0
         mode = self._choose_mode()
         idx = int(idx)
         # Map the flat sample index to a within-episode frame window.
@@ -298,8 +321,11 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
             task = self._tasks[int(observation_rows[0]["task_index"])]
             ai_caption = random.choice(task.split(" | "))
 
+        step_t0 = checkpoint("rows", step_t0)
         video = self._load_concat_video(episode, observation_rows)
+        step_t0 = checkpoint("video_decode_resize_aug", step_t0)
         raw_action = self._build_joint_action(observation_rows)
+        step_t0 = checkpoint("action", step_t0)
 
         result = self._build_result(
             mode=mode,
@@ -315,6 +341,11 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         if self._video_downsample_factor > 1:
             result["conditioning_fps"] = torch.tensor(self._fps / self._video_downsample_factor, dtype=torch.float32)
             result["action_fps"] = torch.tensor(self._fps, dtype=torch.float32)
+        if sample_t0 is not None:
+            step_t0 = checkpoint("build_result", step_t0)
+            result["_sample_time"] = time.monotonic() - sample_t0
+            result["_aug_time"] = sum(step_times.values())
+            result["_aug_step_times"] = step_times
         return result
 
     def _load_lerobot_v21_rows(self, episode: dict[str, Any], start: int, length: int) -> list[dict[str, Any]]:
@@ -342,13 +373,12 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
     ) -> torch.Tensor:
         video_rows = observation_rows[:: self._video_downsample_factor]
         timestamps = [float(row["timestamp"]) for row in video_rows]
+
+        if self._can_use_offline_concat(episode):
+            return self._load_video_key(episode, self._offline_concat_key, timestamps)
+
         frames_by_view = {
-            name: decode_video_frames(
-                self._video_path(episode, video_key),
-                [float(episode.get(f"videos/{video_key}/from_timestamp", 0.0)) + ts for ts in timestamps],
-                self._tolerance_s,
-            )
-            for name, video_key in _IMAGE_FEATURES.items()
+            name: self._load_video_key(episode, video_key, timestamps) for name, video_key in _IMAGE_FEATURES.items()
         }
 
         head = frames_by_view["head"]
@@ -382,6 +412,39 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         if concat.shape[-2:] != self._target_hw:
             concat = F.interpolate(concat, size=self._target_hw, mode="bilinear", align_corners=False)
         return concat
+
+    def _resolve_offline_concat_key(self) -> str | None:
+        if not self._use_offline_concat:
+            return None
+
+        features = self._info.get("features", {})
+        resolution_key = _offline_concat_feature_key(self._target_resolution)
+        if resolution_key in features:
+            return resolution_key
+
+        # Compatibility with older local precomputes that used a resolution-less key.
+        legacy_key = _OFFLINE_CONCAT_FEATURE_PREFIX
+        feature = features.get(legacy_key)
+        if feature is not None and tuple(feature.get("shape", ())[:2]) == self._target_hw:
+            return legacy_key
+        return None
+
+    def _can_use_offline_concat(self, episode: dict[str, Any]) -> bool:
+        if self._offline_concat_key is None:
+            return False
+        if self._use_image_augmentation and not self._use_offline_concat_with_augmentation:
+            return False
+        return self._video_path(episode, self._offline_concat_key).exists()
+
+    def _load_video_key(self, episode: dict[str, Any], video_key: str, timestamps: list[float]) -> torch.Tensor:
+        frames = decode_video_frames(
+            self._video_path(episode, video_key),
+            [float(episode.get(f"videos/{video_key}/from_timestamp", 0.0)) + ts for ts in timestamps],
+            self._tolerance_s,
+        )
+        if video_key == self._offline_concat_key and frames.shape[-2:] != self._target_hw:
+            frames = F.interpolate(frames, size=self._target_hw, mode="bilinear", align_corners=False)
+        return frames
 
     def _video_path(self, episode: dict[str, Any], video_key: str) -> Path:
         if not self._is_lerobot_v21:

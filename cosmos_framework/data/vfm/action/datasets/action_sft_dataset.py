@@ -12,8 +12,10 @@ wrapper composes the two so the experiment can hand a single map-style dataset
 to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 ``get_sft_dataset``).
 """
+
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
@@ -36,12 +38,21 @@ class ActionSFTDataset(Dataset):
         return len(self._dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self._transform(self._dataset[idx], self._resolution)
+        sample = self._dataset[idx]
+        timing_enabled = "_sample_time" in sample
+        transform_t0 = time.monotonic() if timing_enabled else None
+        sample = self._transform(sample, self._resolution)
+        if transform_t0 is not None:
+            elapsed = time.monotonic() - transform_t0
+            sample["_sample_time"] = float(sample.get("_sample_time", 0.0)) + elapsed
+            sample["_aug_time"] = float(sample.get("_aug_time", 0.0)) + elapsed
+            step_times = sample.setdefault("_aug_step_times", {})
+            step_times["transform"] = step_times.get("transform", 0.0) + elapsed
+        return sample
 
     def get_shuffle_blocks(self):
         """Delegate to the inner DROIDLeRobotDataset (per-episode/segment flat-index blocks)."""
         return self._dataset.get_shuffle_blocks()
-
 
 
 class ActionIterableShuffleDataset(IterableDataset):
@@ -154,6 +165,9 @@ def get_action_robotwin_sft_dataset(
     use_image_augmentation: bool = False,
     downsample_video_frames: bool = False,
     video_downsample_factor: int = 4,
+    use_offline_concat: bool = True,
+    use_offline_concat_with_augmentation: bool = False,
+    emit_timing: bool = False,
     resolution: str | int = "384x320",
     target_resolution: str | None = None,
     max_action_dim: int = 64,
@@ -195,6 +209,9 @@ def get_action_robotwin_sft_dataset(
         use_image_augmentation=use_image_augmentation,
         target_resolution=target_resolution,
         video_downsample_factor=video_factor,
+        use_offline_concat=use_offline_concat,
+        use_offline_concat_with_augmentation=use_offline_concat_with_augmentation,
+        emit_timing=emit_timing,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
