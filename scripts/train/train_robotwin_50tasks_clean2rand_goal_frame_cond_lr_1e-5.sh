@@ -42,7 +42,11 @@ export GOAL_LAYOUT="${GOAL_LAYOUT:-concat}"
 export TOML_FILE=examples/toml/sft_config/action_policy_robotwin_goal.toml
 
 export EXTRA_TAIL_OVERRIDES=" \
-    job.name=action_policy_robotwin_50tasks_clean2rand_goal_frame_cond \
+    job.name=action_policy_robotwin_50tasks_clean2rand_goal_frame_cond_lr_1e-5 \
+    optimizer.lr=1e-5 \
+    trainer.max_iter=30000 \
+    scheduler.cycle_lengths=[100000] \
+    model.config.vlm_config.model_instance.config.freeze_und=true \
     dataloader_train.dataloader.datasets.robotwin.dataset.cond=goal_frame_cond \
     dataloader_train.dataloader.datasets.robotwin.dataset.goal_layout=${GOAL_LAYOUT} \
     dataloader_train.dataloader.datasets.robotwin.dataset.action_normalization=meanstd \
