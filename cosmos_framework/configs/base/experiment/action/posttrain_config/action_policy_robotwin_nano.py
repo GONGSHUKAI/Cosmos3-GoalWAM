@@ -259,6 +259,41 @@ action_policy_robotwin_nano["model"]["config"]["max_num_tokens_after_packing"] =
 action_policy_robotwin_nano["model"]["config"]["rectified_flow_training_config"]["loss_scale"] = 10.0
 
 
-for _item in [action_policy_robotwin_nano]:
+# ---------------------------------------------------------------------------
+# ``action_policy_robotwin_nano_goal`` — goal-image conditioned variant.
+#
+# The policy is additionally conditioned on a GOAL IMAGE (last frame of the
+# training episode; terminal frame of the rule-based expert at eval time),
+# injected through the REASONER branch: the frozen Qwen3-VL vision tower
+# encodes the goal frame and its embeddings are scattered at ``<|image_pad|>``
+# placeholder positions inside the caption — the generation tower reads them
+# via the existing joint attention. Trainable parameter set is unchanged
+# (``keys_to_select`` above); the vision tower and reasoner stay frozen.
+#
+# Switches (override per train script):
+#   ...datasets.robotwin.dataset.cond        = text_cond | goal_frame_cond | text_goal_frame_cond
+#   ...datasets.robotwin.dataset.goal_layout = concat | cam_high
+# The eval server must run with the SAME cond/goal_layout (--cond auto reads
+# them from the checkpoint's saved config).
+# ---------------------------------------------------------------------------
+action_policy_robotwin_nano_goal = copy.deepcopy(action_policy_robotwin_nano)
+action_policy_robotwin_nano_goal["job"]["name"] = "action_policy_robotwin_nano_goal"
+# Build the Qwen3-VL vision tower on the reasoner (frozen: "visual" is not in
+# the optimizer keys_to_select allowlist).
+action_policy_robotwin_nano_goal["model"]["config"]["vlm_config"]["model_instance"]["config"]["include_visual"] = True
+# The base Cosmos3-Nano DCP carries no visual.* keys — skip them on warm start;
+# OmniMoTModel.load_pretrained_model_if_needed seeds the tower from the
+# original Qwen3-VL safetensors (vlm_config.model_name) instead. Mid-run
+# resumes restore visual.* from the trained DCP.
+action_policy_robotwin_nano_goal["checkpoint"]["keys_to_skip_loading"] = list(
+    action_policy_robotwin_nano_goal["checkpoint"]["keys_to_skip_loading"]
+) + ["visual"]
+# Goal-conditioning defaults (train scripts override cond per variant).
+_goal_dataset = action_policy_robotwin_nano_goal["dataloader_train"]["dataloader"]["datasets"]["robotwin"]["dataset"]
+_goal_dataset["cond"] = "text_goal_frame_cond"
+_goal_dataset["goal_layout"] = "concat"
+
+
+for _item in [action_policy_robotwin_nano, action_policy_robotwin_nano_goal]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

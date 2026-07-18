@@ -1,0 +1,17 @@
+# Basic experiment configuration (RoboTwin standard keys)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Cosmos policy server (action_policy_server_robotwin.py runs in the cosmos .venv)
+server_host: 127.0.0.1
+server_port: 9876
+replan_steps: 32   # execute this many of the 32 predicted steps, then re-infer
+gripper_hysteresis: false
+
+# text-cond baseline trained on the unified clean+rand 50-task data
+goal_cond: false
+goal_source: oracle

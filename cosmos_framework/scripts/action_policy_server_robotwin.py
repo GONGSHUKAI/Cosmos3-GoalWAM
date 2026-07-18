@@ -6,8 +6,9 @@
 Runs in the cosmos `.venv` (py3.13). A RoboTwin eval client (py3.10 conda env)
 connects over a tiny length-prefixed JSON+base64 protocol — so the client needs
 only socket+numpy, no openpi / torch. This mirrors the in-process FastWAM
-`fastwam_policy`, but the model lives in this separate process because the
-RoboTwin conda env (torch 2.4.1 / sapien) cannot coexist with cosmos (torch 2.10).
+`fastwam_policy`, but the model lives in a separate process because the RoboTwin
+SAPIEN/Curobo stack and the Cosmos training stack intentionally use different
+Python, PyTorch, and CUDA environments.
 
 The server reproduces the RoboTwin training preprocessing EXACTLY (see
 `RoboTwinLeRobotDataset` + the `action_policy_robotwin_nano` experiment):
@@ -27,8 +28,19 @@ Protocol (length-prefixed: 4-byte big-endian length + JSON body):
   request  {"cmd": "reset"}                                 -> {"ok": true}
   request  {"cmd": "infer", "prompt": str,
             "head"/"left"/"right": <ndarray HxWx3 uint8>,
-            "state": <ndarray [14] float>}                  -> {"action": <ndarray [32,14]>}
+            "state": <ndarray [14] float>,
+            OPTIONAL "goal_head"/"goal_left"/"goal_right": <ndarray HxWx3 uint8>}
+                                                            -> {"action": <ndarray [32,14]>}
 ndarrays are encoded as {"__ndarray__": <base64 raw bytes>, "shape": [...], "dtype": str}.
+
+Goal-image conditioning (checkpoints trained with cond=goal_frame_cond or
+cond=text_goal_frame_cond): the request MUST additionally carry the goal
+frames (`goal_head`, and for goal_layout=concat also `goal_left`/`goal_right`)
+— at eval time these come from the terminal observation of the rule-based
+expert rollout (oracle goal). `--cond auto` / `--goal-layout auto` read the
+values the checkpoint was TRAINED with from its saved config so train/eval
+conditioning always matches. `--goal-source generated` is a reserved seam for
+a future goal-image generator (currently NotImplementedError).
 
 Example:
   PYTHONPATH=. python -m cosmos_framework.scripts.action_policy_server_robotwin \
@@ -43,11 +55,11 @@ init_script()
 import argparse
 import base64
 import json
-from pathlib import Path
 import socket
 import socketserver
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -57,10 +69,16 @@ from omegaconf import OmegaConf
 from cosmos_framework.data.vfm.action.action_normalization import denormalize_action, load_action_stats
 from cosmos_framework.data.vfm.action.datasets.robotwin_lerobot_dataset import RoboTwinLeRobotDataset
 from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
+from cosmos_framework.data.vfm.action.goal_image import (
+    GOAL_COND_MODES,
+    GOAL_LAYOUTS,
+    cond_uses_goal_image,
+    validate_goal_layout,
+)
 from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
 from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
-from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.inference.common.init import init_output_dir
+from cosmos_framework.inference.inference import OmniInference
 from cosmos_framework.scripts.action_policy_server_robolab import (
     _build_data_batch_from_sample,
     _ensure_rgb_uint8_image,
@@ -217,8 +235,45 @@ def _read_bool_from_dataloader_config(training_config: Any, key_name: str) -> bo
                 return found
         return None
 
-    dl_train = training_config.get("dataloader_train") if isinstance(training_config, dict) else getattr(
-        training_config, "dataloader_train", None
+    dl_train = (
+        training_config.get("dataloader_train")
+        if isinstance(training_config, dict)
+        else getattr(training_config, "dataloader_train", None)
+    )
+    if dl_train is None:
+        return None
+    return _search(dl_train)
+
+
+def _read_str_from_dataloader_config(training_config: Any, key_name: str) -> str | None:
+    """Recursively search ``dataloader_train`` for a string dataset knob
+    (e.g. ``cond`` / ``goal_layout`` of goal-image conditioning)."""
+    if training_config is None:
+        return None
+
+    def _search(obj: Any) -> str | None:
+        items = None
+        if isinstance(obj, dict):
+            items = obj.items()
+        elif OmegaConf.is_config(obj):
+            try:
+                items = OmegaConf.to_container(obj, resolve=False).items()
+            except Exception:
+                items = None
+        if items is None:
+            return None
+        for key, val in items:
+            if key == key_name:
+                return None if val is None else str(val)
+            found = _search(val)
+            if found is not None:
+                return found
+        return None
+
+    dl_train = (
+        training_config.get("dataloader_train")
+        if isinstance(training_config, dict)
+        else getattr(training_config, "dataloader_train", None)
     )
     if dl_train is None:
         return None
@@ -261,7 +316,9 @@ class RoboTwinPolicyService:
         init_output_dir(setup_args.output_dir)
         setup_args = disable_runtime_ema_for_frozen_config(setup_args)
 
-        log.info(f"[robotwin-policy-server] loading model: checkpoint={checkpoint_path!r} experiment={args.experiment!r}")
+        log.info(
+            f"[robotwin-policy-server] loading model: checkpoint={checkpoint_path!r} experiment={args.experiment!r}"
+        )
         pipe = OmniInference.create(setup_args)
         self.model = pipe.model
         self.model.eval()
@@ -293,6 +350,40 @@ class RoboTwinPolicyService:
                 f"video_downsample_factor={self.video_downsample_factor}"
             )
         self.video_fps = self.conditioning_fps / float(self.video_downsample_factor)
+
+        # Goal-image conditioning: cond/goal_layout must MATCH training. 'auto'
+        # reads them from the checkpoint's saved config (goal-trained runs always
+        # record them; older text-only checkpoints default to text_cond).
+        self.cond = self._resolve_goal_str_knob(args.cond, "cond", "text_cond", training_config)
+        self.goal_layout = self._resolve_goal_str_knob(args.goal_layout, "goal_layout", "concat", training_config)
+        if self.cond not in GOAL_COND_MODES:
+            raise ValueError(f"Unsupported cond={self.cond!r}; expected one of {GOAL_COND_MODES}")
+        validate_goal_layout(self.goal_layout)
+        # R/B channel-swap HOTFIX: the RoboTwin lerobot training videos are
+        # R/B-swapped relative to the true scene (pkl2hdf5.py encodes JPEGs with
+        # cv2.imencode assuming BGR; convert_robotwin_to_lerobot.py decodes them
+        # with PIL), while eval observations arrive true-color. Swapping R/B on
+        # the incoming obs + goal frames feeds the model the color world it was
+        # TRAINED in. Disable (--swap-rb false) only for checkpoints trained on
+        # regenerated, color-correct datasets.
+        self.swap_rb = str(args.swap_rb).lower() in {"1", "true", "yes", "y"}
+        if self.swap_rb:
+            log.warning(
+                "[robotwin-policy-server] R/B CHANNEL SWAP ACTIVE on incoming obs + goal frames "
+                "(hotfix for channel-swapped training videos). If this checkpoint was trained on "
+                "regenerated color-correct data, pass --swap-rb false."
+            )
+        self.goal_source = str(args.goal_source).lower()
+        if self.goal_source == "generated":
+            raise NotImplementedError(
+                "--goal-source generated: plug a goal-image generator here (generate a goal frame "
+                "from the current observation + instruction and feed it as sample['goal_image']); "
+                "only --goal-source oracle (expert terminal observation from the client) is implemented."
+            )
+        if self.goal_source != "oracle":
+            raise ValueError(f"Unsupported --goal-source={self.goal_source!r}")
+        self._warned_ignored_goal_keys = False
+
         tok_cfg = self._extract_tokenizer_config(training_config)
         self._transform = ActionTransformPipeline(
             tokenizer_config=tok_cfg,
@@ -303,6 +394,8 @@ class RoboTwinPolicyService:
             append_duration_fps_timestamps=True,
             append_resolution_info=True,
             append_idle_frames=False,
+            cond=self.cond,
+            goal_layout=self.goal_layout,
         )
         self.guidance = float(args.guidance)
         self.num_steps = int(args.num_steps)
@@ -316,9 +409,7 @@ class RoboTwinPolicyService:
         # we must invert that here to return raw qpos. "auto" reads the method from the
         # training config's dataloader (so a checkpoint trained with raw qpos -> "none",
         # and one trained with meanstd -> "meanstd").
-        self.action_normalization = self._resolve_action_normalization(
-            args.action_normalization, training_config
-        )
+        self.action_normalization = self._resolve_action_normalization(args.action_normalization, training_config)
         self._norm_stats: dict[str, torch.Tensor] | None = None
         if self.action_normalization != "none":
             self._norm_stats = self._load_action_stats(args.action_stats_path)
@@ -327,8 +418,24 @@ class RoboTwinPolicyService:
             f"[robotwin-policy-server] ready domain={_DOMAIN_NAME} id={self._domain_id} res={self.resolution} "
             f"chunk={self.action_chunk_size} video_downsample_factor={self.video_downsample_factor} "
             f"video_fps={self.video_fps} action_fps={self.conditioning_fps} guidance={self.guidance} "
-            f"num_steps={self.num_steps} shift={self.shift} action_normalization={self.action_normalization}"
+            f"num_steps={self.num_steps} shift={self.shift} action_normalization={self.action_normalization} "
+            f"cond={self.cond} goal_layout={self.goal_layout} goal_source={self.goal_source}"
         )
+
+    @staticmethod
+    def _resolve_goal_str_knob(requested: str, key_name: str, fallback: str, training_config: Any) -> str:
+        """Resolve --cond / --goal-layout, reading 'auto' from the saved training config."""
+        requested = str(requested).lower()
+        if requested != "auto":
+            return requested
+        configured = _read_str_from_dataloader_config(training_config, key_name)
+        if configured is None:
+            log.warning(
+                f"[robotwin-policy-server] could not read {key_name!r} from the training config; "
+                f"assuming {fallback!r}. Pass --{key_name.replace('_', '-')} explicitly to override."
+            )
+            return fallback
+        return str(configured).lower()
 
     @staticmethod
     def _resolve_action_normalization(requested: str, training_config: Any) -> str:
@@ -426,13 +533,19 @@ class RoboTwinPolicyService:
             concat = _resize_rgb_uint8(concat, self._target_hw)
         return torch.from_numpy(concat).permute(2, 0, 1).contiguous()  # [3,H,W]
 
+    def _maybe_swap_rb(self, img: np.ndarray) -> np.ndarray:
+        """R/B hotfix: mirror the channel swap baked into the training videos."""
+        if not self.swap_rb:
+            return img
+        return np.ascontiguousarray(img[..., ::-1])
+
     def _build_sample(self, obs: dict[str, Any]) -> dict[str, Any]:
         prompt = obs.get("prompt")
         if not isinstance(prompt, str):
             raise ValueError("'prompt' must be a string")
-        head = _ensure_rgb_uint8_image(obs["head"], "head")
-        left = _ensure_rgb_uint8_image(obs["left"], "left")
-        right = _ensure_rgb_uint8_image(obs["right"], "right")
+        head = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["head"], "head"))
+        left = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["left"], "left"))
+        right = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["right"], "right"))
         state = np.asarray(obs["state"], dtype=np.float32).reshape(-1)
         if state.shape[0] != _ACTION_DIM:
             raise ValueError(f"'state' must have {_ACTION_DIM} dims, got {state.shape}")
@@ -461,6 +574,35 @@ class RoboTwinPolicyService:
             "viewpoint": "concat_view",
             "additional_view_description": _CONCAT_VIEW_DESCRIPTION,
         }
+
+        # Goal-image conditioning: build sample["goal_image"] (uint8 [3,H,W])
+        # from the request's goal frames in the SAME layout used at training;
+        # the shared transform does placeholder-prepend + ViT pixel preprocessing.
+        if cond_uses_goal_image(self.cond):
+            if "goal_head" not in obs:
+                raise ValueError(
+                    f"cond={self.cond!r} requires 'goal_head' (and for goal_layout=concat also "
+                    "'goal_left'/'goal_right') in the infer request — is the RoboTwin client "
+                    "capturing the expert terminal observation (goal_cond: true in deploy_policy.yml)?"
+                )
+            goal_head = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["goal_head"], "goal_head"))
+            if self.goal_layout == "concat":
+                if "goal_left" not in obs or "goal_right" not in obs:
+                    raise ValueError(
+                        "goal_layout='concat' requires 'goal_left' and 'goal_right' goal frames in the infer request"
+                    )
+                goal_left = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["goal_left"], "goal_left"))
+                goal_right = self._maybe_swap_rb(_ensure_rgb_uint8_image(obs["goal_right"], "goal_right"))
+                sample["goal_image"] = self._concat_view(goal_head, goal_left, goal_right)
+            else:  # cam_high — final fixed resize is owned by preprocess_goal_image
+                sample["goal_image"] = torch.from_numpy(goal_head).permute(2, 0, 1).contiguous()
+        elif "goal_head" in obs and not self._warned_ignored_goal_keys:
+            self._warned_ignored_goal_keys = True
+            log.warning(
+                "[robotwin-policy-server] request carries goal frames but the checkpoint was "
+                "trained with cond=text_cond — goal keys are IGNORED. Check the client/server pairing."
+            )
+
         return self._transform(sample, self.resolution)
 
     def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
@@ -564,10 +706,19 @@ def serve(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--checkpoint-path", required=True, help="Trained RoboTwin DCP dir (…/checkpoints/iter_<N>) or safetensors dir / HF repo")
-    p.add_argument("--experiment", default="action_policy_robotwin_nano", help="Hydra experiment for DCP config rebuild")
-    p.add_argument("--vae-path", default="/pfs/pfs-7jnepv/shukaigong/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
-                   help="Local Wan2.2 VAE .pth (overrides the experiment's default registry path; required for --experiment loading)")
+    p.add_argument(
+        "--checkpoint-path",
+        required=True,
+        help="Trained RoboTwin DCP dir (…/checkpoints/iter_<N>) or safetensors dir / HF repo",
+    )
+    p.add_argument(
+        "--experiment", default="action_policy_robotwin_nano", help="Hydra experiment for DCP config rebuild"
+    )
+    p.add_argument(
+        "--vae-path",
+        default="/pfs/pfs-7jnepv/shukaigong/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+        help="Local Wan2.2 VAE .pth (overrides the experiment's default registry path; required for --experiment loading)",
+    )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9876)
     p.add_argument("--resolution", default="384x320")
@@ -610,6 +761,45 @@ def main() -> None:
         help=(
             "Path to the action stats JSON used for denormalization. Defaults to the dataset's "
             "bundled stats/robotwin_lerobot_stats.json. Only used when normalization != none."
+        ),
+    )
+    p.add_argument(
+        "--cond",
+        default="auto",
+        choices=["auto", *GOAL_COND_MODES],
+        help=(
+            "Conditioning mode; must match the value the checkpoint was TRAINED with. "
+            "'auto' reads it from the training config (older text-only checkpoints -> text_cond)."
+        ),
+    )
+    p.add_argument(
+        "--goal-layout",
+        default="auto",
+        choices=["auto", *GOAL_LAYOUTS],
+        help=(
+            "Goal-image layout; must match training. 'auto' reads it from the training config. "
+            "concat = 3-camera inverted-T composite; cam_high = head camera only."
+        ),
+    )
+    p.add_argument(
+        "--goal-source",
+        default="oracle",
+        choices=["oracle", "generated"],
+        help=(
+            "Where goal frames come from. 'oracle' (default): the client sends the rule-based "
+            "expert's terminal observation. 'generated' is a reserved seam for a goal-image "
+            "generator (NotImplementedError for now)."
+        ),
+    )
+    p.add_argument(
+        "--swap-rb",
+        default="true",
+        choices=["true", "false", "1", "0", "yes", "no"],
+        help=(
+            "HOTFIX (default true): swap R/B channels of incoming obs + goal frames so eval "
+            "matches the R/B-swapped RoboTwin lerobot TRAINING videos (cv2.imencode/PIL decode "
+            "mismatch in the data pipeline). Set false ONLY for checkpoints trained on "
+            "regenerated color-correct datasets."
         ),
     )
     args = p.parse_args()

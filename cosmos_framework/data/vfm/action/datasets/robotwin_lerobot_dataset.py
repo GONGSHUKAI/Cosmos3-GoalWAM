@@ -45,6 +45,11 @@ from cosmos_framework.data.vfm.action.action_normalization import load_action_st
 from cosmos_framework.data.vfm.action.action_spec import ActionSpec, Gripper, Joint, build_action_spec
 from cosmos_framework.data.vfm.action.datasets.base_dataset import ActionBaseDataset
 from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
+from cosmos_framework.data.vfm.action.goal_image import (
+    GOAL_COND_MODES,
+    cond_uses_goal_image,
+    validate_goal_layout,
+)
 
 PoseConvention = Literal["backward_framewise"]
 Viewpoint = Literal["concat_view"]
@@ -97,9 +102,15 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         video_downsample_factor: int = 1,
         use_offline_concat: bool = True,
         use_offline_concat_with_augmentation: bool = False,
+        cond: str = "text_cond",
+        goal_layout: str = "concat",
     ) -> None:
         if viewpoint != "concat_view":
             raise NotImplementedError("RoboTwinLeRobotDataset only supports concat_view.")
+        if cond not in GOAL_COND_MODES:
+            raise ValueError(f"Unknown cond={cond!r}; expected one of {GOAL_COND_MODES}")
+        self._cond = cond
+        self._goal_layout = validate_goal_layout(goal_layout)
 
         root_path = Path(root)
         info = json.loads((root_path / "meta" / "info.json").read_text())
@@ -162,6 +173,7 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
             ep_vals, ep_starts, ep_counts = np.unique(self._row_episode, return_index=True, return_counts=True)
             self._ep_vals = ep_vals.astype(np.int64)
             self._ep_starts = ep_starts.astype(np.int64)
+            self._ep_counts = ep_counts.astype(np.int64)
             self._valid_cum = np.cumsum(np.maximum(0, ep_counts - self._chunk_length)).astype(np.int64)
 
     def _init_lerobot_v21(
@@ -324,7 +336,51 @@ class RoboTwinLeRobotDataset(ActionBaseDataset):
         if self._video_downsample_factor > 1:
             result["conditioning_fps"] = torch.tensor(self._fps / self._video_downsample_factor, dtype=torch.float32)
             result["action_fps"] = torch.tensor(self._fps, dtype=torch.float32)
+        if cond_uses_goal_image(self._cond):
+            result["goal_image"] = self._load_goal_frame(ep, episode)
         return result
+
+    def _episode_last_timestamp(self, ep: int, episode: dict[str, Any]) -> float:
+        """Timestamp of the episode's TRUE final frame (deterministic, no jitter)."""
+        if self._is_lerobot_v21:
+            length = int(episode["length"])
+            last_row = self._load_lerobot_v21_rows(episode, length - 1, 1)[0]
+            return float(last_row["timestamp"])
+        last_row = self._rows[int(self._ep_starts[ep]) + int(self._ep_counts[ep]) - 1]
+        return float(last_row["timestamp"])
+
+    def _load_goal_frame(self, ep: int, episode: dict[str, Any]) -> torch.Tensor:
+        """Episode-final frame as uint8 [3,H,W] in the configured goal layout.
+
+        ``concat``: the same 3-camera inverted-T canvas as the training video
+        (offline precomputed concat when available, else built deterministically
+        WITHOUT augmentation — the goal must be reproducible at eval time).
+        ``cam_high``: the head camera frame at its native size; final resizing
+        is owned by ``preprocess_goal_image``.
+        """
+        last_ts = self._episode_last_timestamp(ep, episode)
+
+        if self._goal_layout == "cam_high":
+            frame = self._load_video_key(episode, _IMAGE_FEATURES["head"], [last_ts])  # [1,C,H,W]
+        elif self._offline_concat_key is not None and self._video_path(episode, self._offline_concat_key).exists():
+            # Bypass _can_use_offline_concat's augmentation gate: the goal frame is
+            # always the deterministic offline concat when it exists.
+            frame = self._load_video_key(episode, self._offline_concat_key, [last_ts])
+        else:
+            views = {
+                name: self._load_video_key(episode, video_key, [last_ts]) for name, video_key in _IMAGE_FEATURES.items()
+            }
+            head, left, right = views["head"], views["left"], views["right"]
+            _, _, h_h, w_h = head.shape
+            half_h, half_w = h_h // 2, w_h // 2
+            left = F.interpolate(left, size=(half_h, half_w), mode="bilinear", align_corners=False)
+            right = F.interpolate(right, size=(half_h, half_w), mode="bilinear", align_corners=False)
+            bottom = torch.cat([left, right], dim=-1)
+            frame = torch.cat([head, bottom], dim=-2)
+            if frame.shape[-2:] != self._target_hw:
+                frame = F.interpolate(frame, size=self._target_hw, mode="bilinear", align_corners=False)
+
+        return (frame[0] * 255.0).clamp(0, 255).to(torch.uint8)  # [C,H,W] uint8
 
     def _load_lerobot_v21_rows(self, episode: dict[str, Any], start: int, length: int) -> list[dict[str, Any]]:
         table = pq.read_table(

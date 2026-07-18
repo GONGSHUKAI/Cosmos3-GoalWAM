@@ -143,6 +143,22 @@ def compute_text_split_length(
     return n
 
 
+def _find_image_token_runs(token_ids: List[int], image_token_id: int) -> List[Tuple[int, int]]:
+    """Maximal contiguous runs of ``image_token_id`` as ``(start, length)`` pairs."""
+    runs: List[Tuple[int, int]] = []
+    run_start: int | None = None
+    for i, token_id in enumerate(token_ids):
+        if token_id == image_token_id:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            runs.append((run_start, i - run_start))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(token_ids) - run_start))
+    return runs
+
+
 def pack_text_tokens(
     packed_seq: PackedSequence,
     text_ids: List[int],
@@ -150,6 +166,8 @@ def pack_text_tokens(
     curr_rope_id: int,
     has_generation: bool,
     use_float_positions: bool = False,
+    image_token_id: int | None = None,
+    image_grids: List[Tuple[int, int, int]] | None = None,
 ) -> Tuple[int, int, int]:
     """Pack text tokens into the sequence.
 
@@ -161,6 +179,14 @@ def pack_text_tokens(
         has_generation: Whether there's media/action after text.
         use_float_positions: If True, generate float position IDs for 3D mRoPE
             (for consistency with FPS-modulated vision tokens).
+        image_token_id: Optional id of the reasoner image-placeholder token
+            (Qwen3-VL ``<|image_pad|>``). When set and ``text_ids`` contains
+            contiguous runs of it, each run receives a Qwen3-VL-style 3D mRoPE
+            block (shared t, spatial h/w grid, all axes offset by the running
+            index — matching HF ``get_rope_index``) instead of monotonic text
+            positions; the text after a run resumes at ``max + 1``.
+        image_grids: Post-merge ViT token grid ``(t, h, w)`` per image run, in
+            order of appearance. Required iff ``text_ids`` contains image runs.
 
     Returns:
         Tuple of (updated curr_rope_id, split_length, sample_length).
@@ -212,14 +238,67 @@ def pack_text_tokens(
     assert split_len == compute_text_split_length(len(text_ids), special_tokens, has_generation)
 
     # Update position IDs and attention mode for text split
+    # The full split (caption ids + EOS (+ BOG)) may embed reasoner images as
+    # contiguous placeholder runs; those get grid-style mRoPE blocks.
+    full_split_ids = shifted_text_ids + [special_tokens["eos_token_id"]]
+    if has_generation:
+        full_split_ids = full_split_ids + [special_tokens["start_of_generation"]]
+    image_runs = _find_image_token_runs(full_split_ids, image_token_id) if image_token_id is not None else []
+
     if packed_seq._use_mrope:
-        text_mrope_ids, packed_seq._mrope_temporal_offset = get_3d_mrope_ids_text_tokens(
-            num_tokens=split_len,
-            temporal_offset=packed_seq._mrope_temporal_offset,
-            use_float_positions=use_float_positions,
-        )  # text_mrope_ids: [3,split_len]
+        if image_runs:
+            assert image_grids is not None and len(image_grids) == len(image_runs), (
+                f"text split has {len(image_runs)} image-placeholder run(s) but "
+                f"{0 if image_grids is None else len(image_grids)} image grid(s) were provided "
+                "(sequence_plan.reasoner_image_grids out of sync with the tokenized caption)"
+            )
+            segments: List[torch.Tensor] = []
+            cursor = 0
+            for (run_start, run_len), grid in zip(image_runs, image_grids):
+                if run_start > cursor:
+                    seg, packed_seq._mrope_temporal_offset = get_3d_mrope_ids_text_tokens(
+                        num_tokens=run_start - cursor,
+                        temporal_offset=packed_seq._mrope_temporal_offset,
+                        use_float_positions=use_float_positions,
+                    )
+                    segments.append(seg)
+                grid_t, grid_h, grid_w = (int(v) for v in grid)
+                assert run_len == grid_t * grid_h * grid_w, (
+                    f"image-placeholder run length {run_len} != grid {grid_t}x{grid_h}x{grid_w} "
+                    f"(={grid_t * grid_h * grid_w}) tokens"
+                )
+                # Qwen2/3-VL convention: all axes offset by the running index,
+                # spatial NOT reset; next offset = max position + 1.
+                seg, packed_seq._mrope_temporal_offset = get_3d_mrope_ids_vae_tokens(
+                    grid_t=grid_t,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    temporal_offset=packed_seq._mrope_temporal_offset,
+                    reset_spatial_indices=False,
+                    fps=None,
+                )
+                if use_float_positions:
+                    seg = seg.to(torch.float32)
+                segments.append(seg)
+                cursor = run_start + run_len
+            if cursor < len(full_split_ids):
+                seg, packed_seq._mrope_temporal_offset = get_3d_mrope_ids_text_tokens(
+                    num_tokens=len(full_split_ids) - cursor,
+                    temporal_offset=packed_seq._mrope_temporal_offset,
+                    use_float_positions=use_float_positions,
+                )
+                segments.append(seg)
+            text_mrope_ids = torch.cat(segments, dim=1)  # [3,split_len]
+            assert text_mrope_ids.shape[1] == split_len
+        else:
+            text_mrope_ids, packed_seq._mrope_temporal_offset = get_3d_mrope_ids_text_tokens(
+                num_tokens=split_len,
+                temporal_offset=packed_seq._mrope_temporal_offset,
+                use_float_positions=use_float_positions,
+            )  # text_mrope_ids: [3,split_len]
         packed_seq.position_ids.append(text_mrope_ids)
     else:
+        assert not image_runs, "reasoner image placeholders require 3D mRoPE position embeddings"
         packed_seq.position_ids.extend(range(curr_rope_id, curr_rope_id + split_len))
     packed_seq.attn_modes.append("causal")
     packed_seq.split_lens.append(split_len)

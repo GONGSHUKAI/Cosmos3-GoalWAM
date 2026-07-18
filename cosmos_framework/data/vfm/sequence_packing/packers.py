@@ -43,6 +43,7 @@ def pack_input_sequence(
     video_temporal_causal: bool = False,
     action_dim: int = 32,
     initial_mrope_temporal_offset: int | float = 0,
+    image_token_id: int | None = None,
 ) -> PackedSequence:
     """
     Pack a sequence of input strings and VAE latents into a packed tensor format.
@@ -179,6 +180,8 @@ def pack_input_sequence(
                 curr_rope_id,
                 has_generation=has_generation_for_sample,
                 use_float_positions=use_float_mrope_positions,
+                image_token_id=image_token_id,
+                image_grids=list(getattr(sequence_plan, "reasoner_image_grids", []) or []) or None,
             )
             sample_len += text_sample_len
 

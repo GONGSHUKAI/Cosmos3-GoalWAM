@@ -223,4 +223,10 @@ cython_debug/
 *.pdf
 *.ipynb
 RoboTwin/
-scripts/
+external/
+config/local.env
+scripts/cosmos3-gen/
+scripts/deprecated/
+ROBOTWIN_GOAL_IMAGE_ADAPTION_PLAN.md
+ROBOTWIN_GOAL_IMAGE_ADAPTION_PLAN_CN.md
+evaluate_results/

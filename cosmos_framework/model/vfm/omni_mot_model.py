@@ -16,18 +16,19 @@ from einops import rearrange
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
-from cosmos_framework.utils.timer import Timer
-from cosmos_framework.model.vfm.algorithm.loss.flow_matching import compute_flow_matching_loss
-from cosmos_framework.model.vfm.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
 from cosmos_framework.data.vfm.action.action_processing import ActionProcessor, get_action_processing_records
+from cosmos_framework.data.vfm.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.vfm.sequence_packing.modalities import add_special_tokens
 from cosmos_framework.data.vfm.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+from cosmos_framework.model._base import ImaginaireModel
+from cosmos_framework.model.vfm.algorithm.loss.flow_matching import compute_flow_matching_loss
+from cosmos_framework.model.vfm.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.model.vfm.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.vfm.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.vfm.diffusion.samplers.fixed_step import FixedStepSampler
@@ -36,6 +37,8 @@ from cosmos_framework.model.vfm.mot.context_parallel_utils import context_parall
 from cosmos_framework.model.vfm.mot.cosmos3_vfm_network import Cosmos3VFMNetwork, Cosmos3VFMNetworkConfig
 from cosmos_framework.model.vfm.mot.modeling_utils import has_noisy_tokens
 from cosmos_framework.model.vfm.mot.parallelize_vfm_network import parallelize_vfm_network
+from cosmos_framework.model.vfm.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.vfm.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.vfm.utils.data_and_condition import (
     GenerationDataClean,
     GenerationDataNoised,
@@ -45,16 +48,14 @@ from cosmos_framework.model.vfm.utils.data_and_condition import (
 )
 from cosmos_framework.model.vfm.utils.memory import MemoryState
 from cosmos_framework.model.vfm.utils.safetensors_loader import load_language_model as load_language_model_safetensors
+from cosmos_framework.model.vfm.utils.safetensors_loader import load_visual_tower
 from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import tokenize_caption
-from cosmos_framework.data.vfm.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.vfm.sequence_packing.modalities import add_special_tokens
-from cosmos_framework.model.vfm.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.vfm.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.timer import Timer
 from cosmos_framework.utils.vfm.data_utils import get_vision_data_resolution
 from cosmos_framework.utils.vfm.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.vfm.model_weights_stats import WeightTrainingStat
@@ -148,6 +149,17 @@ class OmniMoTModel(ImaginaireModel):
         self.llm_special_tokens = special_tokens
         self.llm_special_tokens["eos_token_id"] = vlm_tokenizer.eos_token_id
 
+        # Reasoner image-placeholder id (goal-image conditioning). Resolved once
+        # so the packer can give placeholder runs Qwen3-VL grid mRoPE positions
+        # and the network knows which text rows to overwrite with ViT features.
+        # None when the tokenizer has no such token (image conditioning unused).
+        image_pad_id = vlm_tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        unk_id = getattr(vlm_tokenizer, "unk_token_id", None)
+        if image_pad_id is None or image_pad_id < 0 or (unk_id is not None and image_pad_id == unk_id):
+            self.goal_image_token_id: int | None = None
+        else:
+            self.goal_image_token_id = int(image_pad_id)
+
         # 2. Vision tokenizer (images/videos) for generation.
         self.tokenizer_vision_gen: VideoTokenizerInterface = lazy_instantiate(self.config.tokenizer)
         assert self.tokenizer_vision_gen.latent_ch == self.config.state_ch, (
@@ -169,7 +181,6 @@ class OmniMoTModel(ImaginaireModel):
             log.info(f"Sound tokenizer initialized: {type(self.tokenizer_sound_gen).__name__}")
         else:
             self.tokenizer_sound_gen = None
-
 
     def build_net(self, dtype: torch.dtype):
         # Build model network and parallelize it.
@@ -297,6 +308,30 @@ class OmniMoTModel(ImaginaireModel):
         has_checkpoint = has_resumable_checkpoint or has_load_path
 
         pretrained_weights = self.vlm_config.pretrained_weights
+
+        # Seed the vision tower for reasoner-image (goal-image) conditioning,
+        # independent of the reasoner-reseed gate below. The base Cosmos3 DCP
+        # carries no ``visual.*`` keys (goal SKUs add "visual" to
+        # ``checkpoint.keys_to_skip_loading``), so on fresh init and warm start
+        # the tower is seeded from the original Qwen3-VL safetensors — the
+        # officially supported pairing (see convert_model_to_vlm_safetensors /
+        # export_model --vit). A mid-run resume restores ``visual.*`` from the
+        # trained DCP (all net params are checkpointed), so the seed is skipped.
+        if getattr(self.net.language_model, "visual", None) is not None and not has_resumable_checkpoint:
+            visual_source = self.vlm_config.model_name
+            log.info(f"Seeding vision tower (goal-image conditioning) from {visual_source}")
+            load_visual_tower(
+                model=self.net.language_model,
+                checkpoint_path=visual_source,
+                parallel_dims=self.parallel_dims,
+            )
+            if self.config.ema.enabled:
+                load_visual_tower(
+                    model=self.net_ema.language_model,
+                    checkpoint_path=visual_source,
+                    parallel_dims=self.parallel_dims,
+                )
+            log.info("Successfully seeded vision tower weights.")
 
         if self.config.exclude_reasoner_weights_from_checkpoint and not pretrained_weights.enabled:
             raise ValueError(
@@ -568,7 +603,41 @@ class OmniMoTModel(ImaginaireModel):
             video_temporal_causal=self.config.video_temporal_causal,
             action_dim=self.config.max_action_dim,
             initial_mrope_temporal_offset=initial_mrope_temporal_offset,
+            image_token_id=self.goal_image_token_id,
         )
+
+    def _attach_reasoner_images(
+        self,
+        packed_sequence: PackedSequence,
+        gen_data_clean: GenerationDataClean,
+    ) -> None:
+        """Attach reasoner-side conditioning images (goal images) to a finalized
+        PackedSequence so the network can encode them with the frozen vision
+        tower and scatter the embeddings at the image-placeholder positions.
+
+        Consistency guard: the number of placeholder tokens in the packed text
+        ids must match the total merged-token count of the attached grids —
+        a mismatch means the caption placeholders and the pixels went out of
+        sync (e.g. goal_layout mismatch between training and serving).
+        """
+        if gen_data_clean.reasoner_pixel_values is None:
+            return
+        assert self.goal_image_token_id is not None, (
+            "Batch carries goal_pixel_values but the tokenizer has no <|image_pad|> token"
+        )
+        grids = gen_data_clean.reasoner_image_grid_thw
+        assert grids is not None
+        text_ids = packed_sequence.text_ids
+        num_placeholders = int((text_ids == self.goal_image_token_id).sum().item())
+        merge = getattr(self.config, "reasoner_image_spatial_merge_size", 2)
+        num_expected = int((grids.prod(dim=-1) // (merge * merge)).sum().item())
+        assert num_placeholders == num_expected, (
+            f"reasoner-image placeholder tokens in the packed text ({num_placeholders}) != "
+            f"merged ViT tokens of the attached goal images ({num_expected}); "
+            "caption placeholders and goal pixels are out of sync"
+        )
+        packed_sequence.reasoner_pixel_values = gen_data_clean.reasoner_pixel_values
+        packed_sequence.reasoner_image_grid_thw = grids
 
     def _get_temporal_positions_vision(
         self,
@@ -838,6 +907,7 @@ class OmniMoTModel(ImaginaireModel):
             skip_text_tokens=memory_info["skip_text"],
             initial_mrope_temporal_offset=memory_info["initial_temporal_offset"],
         )
+        self._attach_reasoner_images(packed_sequence, gen_data_clean)
 
         # Under independent_action_schedule, overwrite the vision-based action timestep the
         # packer injected with the action timestep, so the denoiser's action timestep embedding
@@ -1932,6 +2002,19 @@ class OmniMoTModel(ImaginaireModel):
             skip_text_tokens=skip_text_tokens,
         )
 
+        # Goal-image conditioning: attach the ViT pixels only when this CFG
+        # branch's captions actually contain the placeholder tokens. The
+        # unconditional branch tokenizes an empty caption (no placeholders),
+        # so it automatically runs without goal conditioning — matching the
+        # joint text+goal dropout used at training time.
+        if (
+            gen_data_clean.reasoner_pixel_values is not None
+            and not skip_text_tokens
+            and self.goal_image_token_id is not None
+            and any(self.goal_image_token_id in t for t in text_tokens)
+        ):
+            self._attach_reasoner_images(packed_sequence, gen_data_clean)
+
         # Set the actual noisy latents (as lists)
         if packed_sequence.vision is not None:
             packed_sequence.vision.tokens = [x.to(**self.tensor_kwargs) for x in noise_x_vision]
@@ -2918,6 +3001,25 @@ class OmniMoTModel(ImaginaireModel):
                 },
                 step=iteration,
             )
+        # Reasoner-side image conditioning (goal images): concatenate the
+        # per-sample ViT pixel/grid tensors in batch order, skipping the None
+        # placeholders of CFG-dropped samples.
+        reasoner_pixel_values = None
+        reasoner_image_grid_thw = None
+        goal_pv_raw = data_batch.get("goal_pixel_values", None)
+        if goal_pv_raw is not None:
+            goal_grid_raw = data_batch.get("goal_grid_thw", None)
+            assert goal_grid_raw is not None and len(goal_grid_raw) == len(goal_pv_raw), (
+                "goal_pixel_values present but goal_grid_thw missing or misaligned"
+            )
+            # reshape tolerates an extra leading batch dim added by inference
+            # data-batch wrappers ([1,N,1536] -> [N,1536], [1,1,3] -> [1,3]).
+            pv_kept = [pv.reshape(-1, pv.shape[-1]) for pv in goal_pv_raw if pv is not None]
+            grid_kept = [g.reshape(-1, 3) for g, pv in zip(goal_grid_raw, goal_pv_raw) if pv is not None]
+            if pv_kept:
+                reasoner_pixel_values = torch.cat(pv_kept, dim=0)
+                reasoner_image_grid_thw = torch.cat([g.to(torch.long) for g in grid_kept], dim=0)
+
         return GenerationDataClean(
             batch_size=batch_size,
             is_image_batch=is_image_batch,
@@ -2934,6 +3036,8 @@ class OmniMoTModel(ImaginaireModel):
             action_domain_id=action_domain_id,
             num_vision_items_per_sample=num_vision_items_per_sample,
             raw_action_dim=raw_action_dim,
+            reasoner_pixel_values=reasoner_pixel_values,
+            reasoner_image_grid_thw=reasoner_image_grid_thw,
         )
 
     def _normalize_video_databatch_inplace(

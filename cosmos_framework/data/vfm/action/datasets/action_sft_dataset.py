@@ -167,10 +167,17 @@ def get_action_robotwin_sft_dataset(
     append_idle_frames: bool = False,
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
+    cond: str = "text_cond",
+    goal_layout: str = "concat",
 ) -> Dataset:
     """Build the RoboTwin (aloha-agilex) action SFT dataset: 14D absolute joint +
     ``use_state``, concat_view, chunk_length 32. Mirrors
     ``get_action_droid_sft_dataset`` without the filter-dict / ee_pose paths.
+
+    ``cond`` selects the conditioning mode (``text_cond`` baseline,
+    ``goal_frame_cond``, ``text_goal_frame_cond``); goal modes attach the
+    episode-final frame as ``goal_image`` in the layout picked by
+    ``goal_layout`` (``concat`` 3-camera canvas or ``cam_high``).
 
     ``action_normalization`` toggles the per-joint normalization ablation:
     ``None`` (default) trains on raw joint qpos (cosmos-DROID behavior);
@@ -199,6 +206,8 @@ def get_action_robotwin_sft_dataset(
         video_downsample_factor=video_factor,
         use_offline_concat=use_offline_concat,
         use_offline_concat_with_augmentation=use_offline_concat_with_augmentation,
+        cond=cond,
+        goal_layout=goal_layout,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
@@ -209,6 +218,8 @@ def get_action_robotwin_sft_dataset(
         append_duration_fps_timestamps=append_duration_fps_timestamps,
         append_resolution_info=append_resolution_info,
         append_idle_frames=append_idle_frames,
+        cond=cond,
+        goal_layout=goal_layout,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:

@@ -9,6 +9,8 @@ from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
+from cosmos_framework.data.vfm.sequence_packing import ModalityData, PackedSequence
+from cosmos_framework.data.vfm.sequence_packing.natten import verify_natten_parameter_list
 from cosmos_framework.model.vfm.mot.attention import build_packed_sequence
 from cosmos_framework.model.vfm.mot.context_parallel_utils import (
     get_context_parallel_last_hidden_state,
@@ -21,8 +23,6 @@ from cosmos_framework.model.vfm.mot.modeling_utils import (
     VideoRopePosition3DEmb,
 )
 from cosmos_framework.model.vfm.utils.memory import MemoryState
-from cosmos_framework.data.vfm.sequence_packing import ModalityData, PackedSequence
-from cosmos_framework.data.vfm.sequence_packing.natten import verify_natten_parameter_list
 
 
 class Cosmos3VFMNetworkConfig(PretrainedConfig):
@@ -603,6 +603,59 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         )
         return packed_sequence, packed_text_embedding.dtype
 
+    def _encode_reasoner_images(
+        self,
+        packed_seq: PackedSequence,
+        packed_sequence: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
+        """Encode reasoner-side conditioning images (e.g. goal images) with the
+        frozen vision tower and scatter their embeddings at the image-placeholder
+        positions of the packed sequence.
+
+        The placeholder runs were tokenized into ``packed_seq.text_ids`` (see
+        ``goal_placeholder_string``) and received Qwen3-VL grid mRoPE positions
+        from the packer; here the meaningless ``embed_tokens(<|image_pad|>)``
+        rows are overwritten with real ViT features — the packed-path analog of
+        Qwen3-VL's ``masked_scatter`` multimodal prefill.
+
+        Returns:
+            tuple of (und_visual_token_mask, deepstack_visual_embeds):
+            a bool mask over ``packed_seq.text_ids`` marking placeholder tokens,
+            and the per-layer DeepStack features, both ``None`` when the batch
+            carries no reasoner images.
+        """
+        if packed_seq.reasoner_pixel_values is None:
+            return None, None
+        assert hasattr(self.language_model, "visual") and self.language_model.visual is not None, (
+            "Batch carries reasoner images (goal-image conditioning) but the model was built "
+            "without a vision tower — use an experiment with include_visual=True "
+            "(e.g. action_policy_robotwin_nano_goal)."
+        )
+        from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import get_image_features
+
+        image_token_id = getattr(self.language_model.config, "image_token_id", None)
+        assert image_token_id is not None, "language_model.config has no image_token_id"
+
+        with torch.no_grad():  # vision tower is frozen; und K/V are constants w.r.t. trainable params
+            image_embeds, deepstack_visual_embeds = get_image_features(
+                self.language_model,
+                packed_seq.reasoner_pixel_values,
+                packed_seq.reasoner_image_grid_thw,
+            )
+        image_embeds = torch.cat(image_embeds, dim=0).to(target_dtype)  # [N_merged_total,hidden_size]
+
+        und_visual_token_mask = packed_seq.text_ids == image_token_id  # [N_text] bool
+        positions = packed_seq.text_indexes[und_visual_token_mask]  # [N_placeholders]
+        assert positions.numel() == image_embeds.shape[0], (
+            f"reasoner-image placeholder count ({positions.numel()}) != ViT embedding count "
+            f"({image_embeds.shape[0]}) — goal_layout mismatch between the checkpoint and the request, "
+            "or pixel/plan misalignment"
+        )
+        packed_sequence[positions] = image_embeds
+        deepstack_visual_embeds = [d.to(target_dtype) for d in deepstack_visual_embeds]
+        return und_visual_token_mask, deepstack_visual_embeds
+
     def _encode_vision(
         self,
         packed_seq: PackedSequence,
@@ -997,6 +1050,12 @@ class Cosmos3VFMNetwork(PreTrainedModel):
 
         packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
 
+        # encode reasoner-side conditioning images (goal-image conditioning):
+        # frozen ViT features overwrite the image-placeholder rows of the text split.
+        und_visual_token_mask, deepstack_visual_embeds = self._encode_reasoner_images(
+            packed_seq, packed_sequence, target_dtype
+        )
+
         # encode vision tokens
         original_latent_shapes: List[Tuple[int, int, int]] | None = None
         if self.config.vision_gen:
@@ -1092,12 +1151,23 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             parallel_dims=sequence_shard_parallel_dims,
         )
 
+        # Only forward the reasoner-image kwargs when present so ForCausalLM
+        # variants without the parameters keep working unchanged.
+        reasoner_image_kwargs = (
+            dict(
+                und_visual_token_mask=und_visual_token_mask,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+            )
+            if deepstack_visual_embeds is not None
+            else {}
+        )
         packed_outputs, lbl_metadata = self.language_model(
             input_pack,
             attention_mask=attention_meta,
             position_ids=packed_position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            **reasoner_image_kwargs,
         )
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,

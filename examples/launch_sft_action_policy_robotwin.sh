@@ -24,7 +24,9 @@
 #   bash examples/launch_sft_action_policy_robotwin.sh
 # ============================================================================
 
-TOML_FILE="examples/toml/sft_config/action_policy_robotwin.toml"
+# Overridable so goal-image-conditioned variants can reuse this launcher
+# (e.g. TOML_FILE=examples/toml/sft_config/action_policy_robotwin_goal.toml).
+: "${TOML_FILE:=examples/toml/sft_config/action_policy_robotwin.toml}"
 : "${DATASET_PATH:=examples/data/lerobot_v30/robotwin_lerobot/success}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Nano}"
 

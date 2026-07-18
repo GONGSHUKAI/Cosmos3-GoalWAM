@@ -46,6 +46,14 @@ class GenerationDataClean:
     action_domain_id: list[torch.Tensor] | None = None  # per-sample domain IDs, None when no action samples
     raw_action_dim: list[torch.Tensor] | None = None  # raw action dimension, used adding masks to loss calculation
 
+    # Reasoner-side (AR) image conditioning (goal-image conditioning):
+    # ViT-ready pixels/grids for images whose placeholder runs are embedded in
+    # the caption text ids, concatenated over samples in batch order (CFG-dropped
+    # samples contribute nothing). Attached onto the finalized PackedSequence by
+    # the model; encoded by the frozen vision tower in the network forward.
+    reasoner_pixel_values: torch.Tensor | None = None  # [N_patches_total, 1536]
+    reasoner_image_grid_thw: torch.Tensor | None = None  # [num_images, 3] PRE-merge grids
+
 
 @dataclass(slots=True)
 class GenerationDataNoised:

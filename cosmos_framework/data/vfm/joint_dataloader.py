@@ -37,6 +37,8 @@ def custom_collate_fn(batch):
         "raw_action_dim",
         "image_size",
         "action_processing_record",
+        "goal_pixel_values",
+        "goal_grid_thw",
     }
 
     # Data keys where a per-sample value of ``None`` is a meaningful signal
@@ -47,7 +49,10 @@ def custom_collate_fn(batch):
     # remaining sound tensors mis-aligned with the plans whose ``has_sound``
     # flag was set BEFORE collation, causing ``sequence_packing`` to index
     # past the end of ``x0_tokens_sound``.
-    sparse_data_keys = {"sound"}
+    # goal_pixel_values/goal_grid_thw are None for CFG-dropped samples in
+    # goal-image conditioning modes; the None placeholders must survive so the
+    # per-sample lists stay 1:1 aligned with sequence_plan.
+    sparse_data_keys = {"sound", "goal_pixel_values", "goal_grid_thw"}
 
     # Handle the case where the batch is already a dictionary (e.g. column-wise batching)
     if isinstance(batch, dict):

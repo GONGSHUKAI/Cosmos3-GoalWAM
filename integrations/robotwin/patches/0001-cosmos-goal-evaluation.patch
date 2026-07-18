@@ -1,0 +1,49 @@
+diff --git a/script/eval_policy.py b/script/eval_policy.py
+index eded198..06c1089 100644
+--- a/script/eval_policy.py
++++ b/script/eval_policy.py
+@@ -162 +162,2 @@ def main(usr_args):
+-    test_num = 100
++    # Episodes per task; override via eval.sh --overrides --test_num N (default 100).
++    test_num = int(usr_args.get("test_num", 100))
+@@ -217,0 +219,6 @@ def eval_policy(task_name,
++    # Fail fast when the process is permanently broken (e.g. a Warp/curobo
++    # kernel-cache compile race at startup leaves the planner unusable): a
++    # healthy env never throws generic exceptions this many times in a row.
++    consecutive_expert_errors = 0
++    max_consecutive_expert_errors = 50
++
+@@ -221,0 +229,6 @@ def eval_policy(task_name,
++        # Goal-image conditioning: terminal observation of the successful
++        # rule-based expert rollout (the oracle goal image), captured during
++        # the expert seed-check below and handed to policies that opt in via
++        # set_episode_ref_obs (e.g. cosmos_policy with goal_cond: true).
++        expert_final_obs = None
++
+@@ -225,0 +239,2 @@ def eval_policy(task_name,
++                if TASK_ENV.plan_success and TASK_ENV.check_success():
++                    expert_final_obs = TASK_ENV.get_obs()  # sim is at the expert's terminal (goal) state
+@@ -230,0 +246 @@ def eval_policy(task_name,
++                consecutive_expert_errors = 0  # sim ran; the env itself is healthy
+@@ -236,4 +252,10 @@ def eval_policy(task_name,
+-                # stack_trace = traceback.format_exc()
+-                # print(" -------------")
+-                # print("Error: ", e)
+-                # print(" -------------")
++                consecutive_expert_errors += 1
++                print("error occurs !")
++                if consecutive_expert_errors <= 3 or consecutive_expert_errors % 100 == 0:
++                    traceback.print_exc()
++                if consecutive_expert_errors >= max_consecutive_expert_errors:
++                    raise RuntimeError(
++                        f"expert check raised {consecutive_expert_errors} consecutive exceptions "
++                        f"(last seed {now_seed}) — this process is likely permanently broken "
++                        "(e.g. Warp kernel-cache compile race at startup); aborting instead of "
++                        "spinning through seeds forever.") from e
+@@ -243 +264,0 @@ def eval_policy(task_name,
+-                print("error occurs !")
+@@ -244,0 +266 @@ def eval_policy(task_name,
++            consecutive_expert_errors = 0
+@@ -292,0 +315,2 @@ def eval_policy(task_name,
++        if expert_final_obs is not None and hasattr(model, "set_episode_ref_obs"):
++            model.set_episode_ref_obs(expert_final_obs)  # oracle goal for goal-conditioned policies

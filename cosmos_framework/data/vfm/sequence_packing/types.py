@@ -155,6 +155,15 @@ class PackedSequence:
     action: ModalityData | None = None
     sound: ModalityData | None = None
 
+    # Reasoner-side (AR) image conditioning (e.g. goal-image conditioning).
+    # Attached AFTER finalize() by the model (OmniMoTModel._attach_reasoner_images):
+    # ViT-ready pixels for every image whose placeholder run is embedded in
+    # text_ids, concatenated over samples in packing order. The network encodes
+    # them with the frozen vision tower and scatters the embeddings at the
+    # placeholder positions of the packed sequence.
+    reasoner_pixel_values: torch.Tensor | None = None  # [N_patches_total, 1536]
+    reasoner_image_grid_thw: torch.Tensor | None = None  # [num_images, 3] PRE-merge grids
+
     def finalize(
         self,
         gen_data_clean: GenerationDataClean,
@@ -284,6 +293,10 @@ class PackedSequence:
             self.action.to_cuda()
         if self.sound is not None:
             self.sound.to_cuda()
+        if self.reasoner_pixel_values is not None:
+            self.reasoner_pixel_values = self.reasoner_pixel_values.cuda()
+        if self.reasoner_image_grid_thw is not None:
+            self.reasoner_image_grid_thw = self.reasoner_image_grid_thw.cuda()
 
 
 @dataclass
@@ -337,6 +350,14 @@ class SequencePlan:
     has_sound: bool = False
     condition_frame_indexes_sound: list[int] = field(default_factory=list)
 
+    # -- reasoner-side (AR) image conditioning --
+    # Post-merge ViT token grids (t, h, w), one per image embedded in this
+    # sample's text ids as a contiguous run of image-placeholder tokens
+    # (e.g. goal-image conditioning). [] means no reasoner images. The packer
+    # uses these grids to give placeholder runs Qwen3-VL-style 3D mRoPE
+    # positions instead of monotonic text positions.
+    reasoner_image_grids: list[tuple[int, int, int]] = field(default_factory=list)
+
     def as_dict(self) -> dict:
         return {
             "has_text": self.has_text,
@@ -347,6 +368,7 @@ class SequencePlan:
             "condition_frame_indexes_action": self.condition_frame_indexes_action,
             "condition_frame_indexes_sound": self.condition_frame_indexes_sound,
             "share_vision_temporal_positions": self.share_vision_temporal_positions,
+            "reasoner_image_grids": self.reasoner_image_grids,
         }
 
 

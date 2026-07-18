@@ -1,4 +1,7 @@
-# Cosmos3-Nano DROID 后训练 + (后续) RoboTwin 评测 笔记
+# Cosmos3-Nano / RoboTwin 开发历史笔记
+
+> 本文件是开发过程记录，前半部分包含早期 DROID/RoboTwin 规划，部分状态描述已过时。
+> 当前可复现的 GoalWAM 环境、训练和评测步骤以仓库根目录 `README.md` 为准；本文件后半部分保留实现背景、数据转换和问题排查细节。
 
 本文记录在本机用 Cosmos3-Nano 复现 DROID action policy 后训练的全过程，以及为后续 RoboTwin 闭环评测做的环境规划。路径以当前机器为准。
 

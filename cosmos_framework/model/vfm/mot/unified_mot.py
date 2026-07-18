@@ -12,9 +12,19 @@ import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from cosmos_framework.data.vfm.sequence_packing.runtime import (
+    SequencePack,
+    from_all_seq,
+    from_und_gen_splits,
+    get_device_and_dtype,
+    get_gen_seq,
+    get_und_seq,
+    set_gen_seq,
+    set_und_seq,
+    zeros_like,
+)
 from cosmos_framework.model.attention import attention as imaginaire_attention
 from cosmos_framework.model.attention.masks import CausalType
-from cosmos_framework.utils import log
 from cosmos_framework.model.vfm.mot.attention import (
     AttentionMaskType,
     dispatch_attention,
@@ -68,17 +78,7 @@ from cosmos_framework.model.vfm.vlm.qwen3_vl_moe.qwen3_vl_moe import (
     Qwen3VLMoeTextSparseMoeBlock,
     Qwen3VLMoeVisionModel,
 )
-from cosmos_framework.data.vfm.sequence_packing.runtime import (
-    SequencePack,
-    from_all_seq,
-    from_und_gen_splits,
-    get_device_and_dtype,
-    get_gen_seq,
-    get_und_seq,
-    set_gen_seq,
-    set_und_seq,
-    zeros_like,
-)
+from cosmos_framework.utils import log
 
 # Torch optimization settings
 torch._dynamo.config.cache_size_limit = 512
@@ -852,6 +852,8 @@ def _impl_forward(
     position_ids: torch.Tensor,
     natten_metadata_list: list | None = None,
     memory: MemoryState | None = None,
+    und_visual_token_mask: torch.Tensor | None = None,
+    deepstack_visual_embeds: list[torch.Tensor] | None = None,
 ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
     """Shared training forward pass for the three MoT text models.
 
@@ -866,6 +868,13 @@ def _impl_forward(
         natten_metadata_list: Optional per-layer NATTEN metadata.
         memory: Optional ``MemoryState`` for persistent memory across
             forward passes.
+        und_visual_token_mask: Bool mask over the und (text) tokens in
+            ``text_ids`` order marking reasoner image-placeholder positions
+            (goal-image conditioning). Required when
+            ``deepstack_visual_embeds`` is provided.
+        deepstack_visual_embeds: Per-deepstack-layer ViT features re-added at
+            the masked und positions after decoder layers ``0..len-1``,
+            mirroring ``_impl_reasoner_forward``'s DeepStack handling.
     """
 
     # Create position embeddings (Qwen3 style) - squeeze once at model level
@@ -892,6 +901,25 @@ def _impl_forward(
 
     hidden_states = pack
 
+    # Reasoner-side image conditioning (DeepStack): build the padded und mask
+    # once. The und ("causal") sequence is exactly the text tokens in
+    # ``text_ids`` order, right-padded — so the mask is the placeholder mask
+    # zero-extended to the (possibly cuda-graph-padded) causal length.
+    und_mask_padded: torch.Tensor | None = None
+    if deepstack_visual_embeds is not None:
+        assert und_visual_token_mask is not None, (
+            "und_visual_token_mask is required when deepstack_visual_embeds is provided"
+        )
+        assert not pack.get("is_sharded", False), (
+            "reasoner-image DeepStack is not supported under context parallel (sharded und sequence)"
+        )
+        causal_len = int(get_und_seq(hidden_states).shape[0])
+        assert causal_len >= int(und_visual_token_mask.shape[0]), (
+            f"causal seq len {causal_len} < und mask len {int(und_visual_token_mask.shape[0])}"
+        )
+        und_mask_padded = torch.zeros(causal_len, dtype=torch.bool, device=device)
+        und_mask_padded[: und_visual_token_mask.shape[0]] = und_visual_token_mask.to(device)
+
     # --- MemoryState: per-step init (outside compile) ---
     if memory is not None:
         memory.init(hidden_states, device)
@@ -915,6 +943,14 @@ def _impl_forward(
         # MemoryState: store K/V produced by this layer (outside compile)
         if kv_to_store is not None and memory is not None:
             memory.write_for_layer(i, kv_to_store)
+
+        # DeepStack: re-add ViT multi-level features at the reasoner
+        # image-placeholder positions after the first len(deepstack) layers
+        # (same contract as _impl_reasoner_forward).
+        if deepstack_visual_embeds is not None and i < len(deepstack_visual_embeds):
+            und = get_und_seq(hidden_states).clone()
+            und[und_mask_padded] = und[und_mask_padded] + deepstack_visual_embeds[i].to(und.dtype)
+            set_und_seq(hidden_states, und)
 
         for pathway, lbl_metadata in lbl_metadata_dict.items():
             lbl_metadata_all[pathway].append(lbl_metadata)
@@ -2015,14 +2051,26 @@ class Qwen3VLTextForCausalLM(Qwen3VLPreTrainedModel):
         position_ids: torch.Tensor,
         natten_metadata_list: list | None = None,
         memory: MemoryState | None = None,
+        und_visual_token_mask: torch.Tensor | None = None,
+        deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> tuple[SequencePack, dict[str, LBLMetadata]]:
-        """Training forward pass — delegates to the dense text model."""
+        """Training forward pass — delegates to the dense text model.
+
+        ``und_visual_token_mask`` / ``deepstack_visual_embeds`` carry
+        reasoner-side image conditioning (goal images): a bool mask over the
+        und (text) tokens marking image-placeholder positions, and the ViT's
+        per-layer DeepStack features to be re-added at those positions after
+        the first decoder layers (Qwen3-VL DeepStack, mirrored from
+        ``_impl_reasoner_forward``).
+        """
         outputs = self.model(
             pack=pack,
             attention_mask=attention_mask,
             position_ids=position_ids,
             natten_metadata_list=natten_metadata_list,
             memory=memory,
+            und_visual_token_mask=und_visual_token_mask,
+            deepstack_visual_embeds=deepstack_visual_embeds,
         )
         return outputs
 

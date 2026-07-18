@@ -50,9 +50,9 @@ from safetensors.torch import load as load_safetensors
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils import log
 from cosmos_framework.utils.easy_io import easy_io
+from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.vfm.parallelism import ParallelDims
 
 # Prefixes stripped when matching checkpoint keys to model state-dict keys.
@@ -1470,5 +1470,123 @@ def load_vfm_model(
 
     log.info(
         f"load_vfm_model: loaded {len(keys_loaded)} tensors from {checkpoint_path} in {time.time() - start_time:.1f}s"
+    )
+    return keys_loaded
+
+
+def _resolve_visual_checkpoint_dir(checkpoint_path: str) -> str:
+    """Resolve the visual-tower weight source to a local directory.
+
+    Accepts a local directory, or a bare HuggingFace repo id
+    (``org/repo``) which is resolved through the local HF cache first
+    (offline-safe when the snapshot is already cached) and downloaded
+    only as a fallback.
+    """
+    if os.path.isdir(checkpoint_path):
+        return checkpoint_path
+    if re.fullmatch(r"[\w.\-]+/[\w.\-]+", checkpoint_path):
+        from huggingface_hub import snapshot_download
+
+        try:
+            return snapshot_download(repo_id=checkpoint_path, local_files_only=True)
+        except Exception:
+            log.info(f"load_visual_tower: {checkpoint_path} not in local HF cache, downloading")
+            return snapshot_download(repo_id=checkpoint_path)
+    return checkpoint_path
+
+
+def load_visual_tower(
+    model: torch.nn.Module,
+    checkpoint_path: str,
+    parallel_dims: ParallelDims | None,
+) -> set[str]:
+    """Seed the Qwen3-VL vision tower (``model.visual.*``) from an HF checkpoint.
+
+    Counterpart of :func:`load_language_model` for the ``visual`` submodule the
+    qwen3 converter deliberately discards. Used by goal-image conditioning
+    experiments (``include_visual=True``): the base Cosmos3 DCP carries no
+    ``visual.*`` keys, so on fresh init / warm start the tower is seeded from
+    the original Qwen3-VL safetensors (mid-run resumes restore it from the
+    trained DCP instead and skip this loader).
+
+    Sharded targets are populated via ``distribute_tensor`` with the target's
+    own mesh/placements, so arbitrary FSDP shard sizes (including uneven
+    splits) are handled.
+
+    Args:
+        model: The ``*ForCausalLM`` module owning ``.visual``.
+        checkpoint_path: Local safetensors dir or bare HF repo id
+            (e.g. ``Qwen/Qwen3-VL-8B-Instruct``).
+        parallel_dims: ParallelDims for multi-rank file loading (or None).
+
+    Returns:
+        Set of model state-dict keys loaded.
+    """
+    assert getattr(model, "visual", None) is not None, "load_visual_tower: model has no .visual submodule"
+    checkpoint_path = _resolve_visual_checkpoint_dir(checkpoint_path)
+
+    start_time = time.time()
+    log.info(f"load_visual_tower: loading visual weights from {checkpoint_path}")
+
+    visual_state_dict = {}
+    for name, tensor in model.state_dict().items():
+        final_name = name.replace("_orig_mod.", "").replace("_checkpoint_wrapped_module.", "")
+        if final_name.startswith("visual."):
+            visual_state_dict[final_name] = tensor
+
+    assert visual_state_dict, "load_visual_tower: model state dict has no visual.* keys"
+
+    loader = MultiRankCheckpointLoader(_get_dp_shard_mesh(parallel_dims))
+    rank_tensors, rank_tensor_metadata, weights_of_ckpt_names = loader.load_files_parallel(
+        checkpoint_path=checkpoint_path,
+        credential_path=None,
+        loading_device="cpu",
+    )
+    all_tensor_names, tensor_to_rank_map = loader.gather_tensor_names_and_build_mapping(
+        weights_of_ckpt_names, rank_tensors
+    )
+
+    keys_loaded = set()
+    for name, tensor in loader.iterate_tensors(
+        all_tensor_names,
+        tensor_to_rank_map,
+        rank_tensors,
+        rank_tensor_metadata,
+        device="cuda",
+    ):
+        if not name.startswith("model.visual."):
+            continue
+        dest_name = name.replace("model.visual.", "visual.")
+        if dest_name not in visual_state_dict:
+            raise ValueError(f"Unexpected visual weight in checkpoint: {name} (no matching model key {dest_name})")
+        target_tensor = visual_state_dict[dest_name]
+        if isinstance(target_tensor, DTensor):
+            from torch.distributed.tensor import distribute_tensor
+
+            sharded = distribute_tensor(
+                tensor.to(device=target_tensor.device),
+                device_mesh=target_tensor.device_mesh,
+                placements=target_tensor.placements,
+            )
+            with torch.no_grad():
+                target_tensor.to_local().data.copy_(sharded.to_local())
+        else:
+            if tensor.device != target_tensor.device:
+                tensor = tensor.to(target_tensor.device)
+            assert target_tensor.shape == tensor.shape, (
+                f"Shape mismatch for {dest_name}: {target_tensor.shape} != {tensor.shape}"
+            )
+            with torch.no_grad():
+                target_tensor.data.copy_(tensor)
+        keys_loaded.add(dest_name)
+
+    keys_missing = set(visual_state_dict.keys()) - keys_loaded
+    assert not keys_missing, (
+        f"load_visual_tower: {len(keys_missing)} visual.* keys not found in the checkpoint, "
+        f"e.g. {sorted(keys_missing)[:5]}"
+    )
+    log.info(
+        f"load_visual_tower: loaded {len(keys_loaded)} visual tensors from {checkpoint_path} "
+        f"in {time.time() - start_time:.1f}s"
     )
     return keys_loaded

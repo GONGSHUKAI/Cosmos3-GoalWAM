@@ -16,13 +16,22 @@ for the map-to-iterable wrapper.
 
 from __future__ import annotations
 
+import random
+
 import torch
 import torchvision.transforms.functional as transforms_F
 
-from cosmos_framework.utils import log
 from cosmos_framework.data.vfm.action.action_processing import (
     ActionNormalizer,
     ActionProcessor,
+)
+from cosmos_framework.data.vfm.action.goal_image import (
+    GOAL_COND_MODES,
+    cond_uses_goal_image,
+    goal_placeholder_string,
+    merged_grid,
+    preprocess_goal_image,
+    validate_goal_layout,
 )
 from cosmos_framework.data.vfm.action.json_formatter import ActionPromptJsonFormatter
 from cosmos_framework.data.vfm.action.viewpoint_utils import ViewpointTextInfo
@@ -30,8 +39,9 @@ from cosmos_framework.data.vfm.augmentors.duration_fps_text_timestamps import Du
 from cosmos_framework.data.vfm.augmentors.idle_frames_text_info import IdleFramesTextInfo
 from cosmos_framework.data.vfm.augmentors.resolution_text_info import ResolutionTextInfo
 from cosmos_framework.data.vfm.augmentors.text_tokenizer import TextTokenizerTransform
-from cosmos_framework.data.vfm.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.data.vfm.sequence_packing import SequencePlan
+from cosmos_framework.data.vfm.utils import VIDEO_RES_SIZE_INFO
+from cosmos_framework.utils import log
 from cosmos_framework.utils.vfm.data_utils import get_vision_data_resolution
 
 
@@ -287,9 +297,7 @@ def build_sequence_plan_from_mode(
         raise ValueError(f"Invalid mode: {mode!r}. Must be one of {valid_modes}")
     action_video_downsample_factor = int(action_video_downsample_factor)
     if action_video_downsample_factor < 1:
-        raise ValueError(
-            f"action_video_downsample_factor must be >= 1, got {action_video_downsample_factor}"
-        )
+        raise ValueError(f"action_video_downsample_factor must be >= 1, got {action_video_downsample_factor}")
 
     # Determine if action should be included based on mode
     # image2video mode: no action (pure image-to-video generation)
@@ -497,14 +505,26 @@ class ActionTransformPipeline:
         idle_frames_dropout: float = 0.05,
         format_prompt_as_json: bool = False,
         action_video_downsample_factor: int = 1,
+        cond: str = "text_cond",
+        goal_layout: str = "concat",
     ) -> None:
+        if cond not in GOAL_COND_MODES:
+            raise ValueError(f"Unknown cond={cond!r}; expected one of {GOAL_COND_MODES}")
+        self.cond: str = cond
+        self.goal_layout: str = validate_goal_layout(goal_layout)
+        # In goal modes the pipeline owns the CFG coin (ONE draw drops the
+        # instruction text AND the goal image together); the inner text
+        # tokenizer must then never drop on its own.
+        self._goal_cfg_dropout_rate: float = cfg_dropout_rate if cond_uses_goal_image(cond) else 0.0
+        if cond_uses_goal_image(cond):
+            if format_prompt_as_json:
+                raise NotImplementedError("goal-image conditioning does not support format_prompt_as_json")
+            cfg_dropout_rate = 0.0
         self.caption_key: str = caption_key
         self.video_temporal_downsample: int = video_temporal_downsample
         self.action_video_downsample_factor: int = int(action_video_downsample_factor)
         if self.action_video_downsample_factor < 1:
-            raise ValueError(
-                f"action_video_downsample_factor must be >= 1, got {self.action_video_downsample_factor}"
-            )
+            raise ValueError(f"action_video_downsample_factor must be >= 1, got {self.action_video_downsample_factor}")
         self.max_action_dim: int = max_action_dim
         self.action_channel_masking: bool = action_channel_masking
         self.action_processor: ActionProcessor = ActionProcessor(
@@ -627,6 +647,34 @@ class ActionTransformPipeline:
         mode = data_dict.get("mode")
         assert mode is not None, "mode is required"
 
+        # Goal-image conditioning. Runs BEFORE the caption appenders because
+        # they skip empty captions (the empty-caption == unconditional
+        # convention): prepending the placeholder block here keeps the caption
+        # non-empty, so goal_frame_cond (instruction blanked) still receives
+        # the viewpoint/fps/resolution metadata — the only delta vs text_cond
+        # is then instruction <-> goal image. One CFG coin drops the caption
+        # AND the goal image together (the inner tokenizer's own dropout is
+        # disabled in goal modes); a dropped sample keeps an empty caption, so
+        # the appenders skip it — identical semantics to the baseline uncond.
+        goal_image = data_dict.pop("goal_image", None)
+        goal_image_grids: list[tuple[int, int, int]] = []
+        if cond_uses_goal_image(self.cond):
+            assert goal_image is not None, f"cond={self.cond!r} requires a 'goal_image' entry in the sample dict"
+            if self.cond == "goal_frame_cond":
+                data_dict[self.caption_key] = ""
+            caption = data_dict.get(self.caption_key, "")
+            assert isinstance(caption, str), "goal-image conditioning requires a plain-string caption"
+            if random.random() < self._goal_cfg_dropout_rate:
+                data_dict[self.caption_key] = ""
+                data_dict["goal_pixel_values"] = None
+                data_dict["goal_grid_thw"] = None
+            else:
+                pixel_values, grid_thw, n_tokens = preprocess_goal_image(goal_image, self.goal_layout)
+                data_dict[self.caption_key] = goal_placeholder_string(n_tokens) + caption
+                data_dict["goal_pixel_values"] = pixel_values
+                data_dict["goal_grid_thw"] = grid_thw
+                goal_image_grids = [merged_grid(grid_thw)]
+
         # 1. Resize + reflection-pad spatial dimensions to the closest predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
         data_dict = self.video_resize(data_dict, resolution)
 
@@ -685,6 +733,7 @@ class ActionTransformPipeline:
             num_history_actions=num_history_actions,
             action_video_downsample_factor=self.action_video_downsample_factor,
         )
+        sequence_plan.reasoner_image_grids = goal_image_grids
         data_dict["sequence_plan"] = sequence_plan
 
         if sequence_plan.has_action:
